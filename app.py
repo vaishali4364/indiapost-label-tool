@@ -117,7 +117,6 @@ if uploaded_ebay and template_wb and catalog_df is not None:
     content = uploaded_ebay.getvalue().decode("utf-8-sig", errors="ignore")
     lines = content.splitlines()
 
-    # Locate the header row safely
     header_idx = None
     for idx, line in enumerate(lines[:10]):
       if "order number" in line.lower():
@@ -125,10 +124,7 @@ if uploaded_ebay and template_wb and catalog_df is not None:
         break
 
     if header_idx is None:
-      st.error(
-          "Could not detect eBay Order Number header. Please check your CSV"
-          " file."
-      )
+      st.error("Could not detect eBay Order Number header.")
       st.stop()
 
     raw_ebay = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])), dtype=str)
@@ -161,15 +157,35 @@ if uploaded_ebay and template_wb and catalog_df is not None:
       if old_k in raw_ebay.columns and new_k not in raw_ebay.columns:
         raw_ebay[new_k] = raw_ebay[old_k]
 
-    # Filter out empty and footer rows
+    # Filter out non-order rows
+    order_pattern = r"^\d{2}-\d{5}-\d{5}$"
     valid_orders = raw_ebay[
         raw_ebay["Order number"]
         .astype(str)
         .str.strip()
-        .str.contains(r"^\d{2}-\d{5}-\d{5}$", regex=True)
+        .str.contains(order_pattern, regex=True)
     ].copy()
 
-    # Drop parent bundle lines that lack item titles
+    # CRITICAL: Forward-fill address & buyer fields within each multi-item order group
+    addr_cols_to_fill = [
+        "Buyer name",
+        "Post to name",
+        "Post to address 1",
+        "Post to address 2",
+        "Post to city",
+        "Post to county",
+        "Post to postcode",
+        "Post to country",
+        "Post to phone",
+    ]
+    for col in addr_cols_to_fill:
+      if col in valid_orders.columns:
+        valid_orders[col] = valid_orders[col].replace("", pd.NA)
+        valid_orders[col] = valid_orders.groupby("Order number")[
+            col
+        ].transform(lambda s: s.ffill().bfill())
+
+    # Now safely drop parent rows that have no item title
     if "Item title" in valid_orders.columns:
       valid_orders = valid_orders[
           valid_orders["Item title"].fillna("").str.strip() != ""
@@ -181,14 +197,37 @@ if uploaded_ebay and template_wb and catalog_df is not None:
     subpiece_rows = []
     serial_no = 1
 
-    # Group by order number to bundle multi-item orders
     for order_id, order_group in valid_orders.groupby("Order number", sort=False):
       first_row = order_group.iloc[0]
 
-      dest_country = str(
-          first_row.get("Post to country", "United Kingdom")
+      dest_country_raw = str(
+          first_row.get(
+              "Post to country", first_row.get("Buyer country", "United Kingdom")
+          )
       ).strip()
-      country_cd = "GB" if "united kingdom" in dest_country.lower() else "US"
+      if pd.isna(dest_country_raw) or dest_country_raw.lower() in [
+          "nan",
+          "none",
+          "",
+      ]:
+        dest_country = "United Kingdom"
+      else:
+        dest_country = dest_country_raw
+
+      if (
+          "united kingdom" in dest_country.lower()
+          or "great britain" in dest_country.lower()
+      ):
+        country_cd = "GB"
+        dest_country = "United Kingdom"
+      elif (
+          "united states" in dest_country.lower()
+          or "usa" in dest_country.lower()
+      ):
+        country_cd = "US"
+        dest_country = "United States"
+      else:
+        country_cd = "GB"
 
       rec_name = str(
           first_row.get("Post to name", first_row.get("Buyer name", ""))
@@ -197,7 +236,13 @@ if uploaded_ebay and template_wb and catalog_df is not None:
       rec_add2 = str(first_row.get("Post to address 2", "")).strip()
       rec_city = str(first_row.get("Post to city", "")).strip().title()
       rec_state = str(first_row.get("Post to county", "")).strip().title()
-      rec_zip = clean_uk_postcode(first_row.get("Post to postcode", ""))
+
+      raw_postcode = str(first_row.get("Post to postcode", "")).strip()
+      rec_zip = (
+          clean_uk_postcode(raw_postcode)
+          if country_cd == "GB"
+          else raw_postcode
+      )
       rec_phone = clean_phone(first_row.get("Post to phone", ""))
 
       order_weight_total = 0
@@ -212,7 +257,6 @@ if uploaded_ebay and template_wb and catalog_df is not None:
         curr_code, item_price, ex_rate = parse_currency_and_val(sold_for_raw)
         item_inr = int(round(item_price * ex_rate))
 
-        # Lookup in product catalog: try item_id first, then keyword matching
         matched = None
         for _, cat in catalog_df.iterrows():
           cat_id = str(cat.get("item_id", "")).strip()
@@ -305,29 +349,24 @@ if uploaded_ebay and template_wb and catalog_df is not None:
 
       serial_no += 1
 
-    # Load output into template sheets
     ws_art = template_wb["ArticleDetails"]
     ws_sub = template_wb["SubPieces"]
 
-    # Clear pre-existing data rows (keep headers)
     if ws_art.max_row > 1:
       ws_art.delete_rows(2, ws_art.max_row)
     if ws_sub.max_row > 1:
       ws_sub.delete_rows(2, ws_sub.max_row)
 
-    # Write ArticleDetails
     art_headers = [cell.value for cell in ws_art[1]]
     for r in article_rows:
       row_vals = [r.get(h, None) for h in art_headers]
       ws_art.append(row_vals)
 
-    # Write SubPieces
     sub_headers = [cell.value for cell in ws_sub[1]]
     for r in subpiece_rows:
       row_vals = [r.get(h, None) for h in sub_headers]
       ws_sub.append(row_vals)
 
-    # Export to memory
     output_stream = io.BytesIO()
     template_wb.save(output_stream)
     output_stream.seek(0)
