@@ -1,386 +1,177 @@
-import io
-import re
-from datetime import datetime
-import openpyxl
+import math
+import numpy as np
 import pandas as pd
-import streamlit as st
 
-st.set_page_config(
-    page_title="India Post Bulk Upload Generator", layout="wide"
-)
-
-st.title("📦 Sharmex Global - India Post Label Generator")
-st.write(
-    "Upload your eBay Awaiting Dispatch CSV to automatically generate India"
-    " Post bulk booking templates."
-)
-
-# ----------------- SENDER CONFIGURATION -----------------
-SENDER_DETAILS = {
-    "NAME": "NEELA SHARMA",
-    "COMPANY": "SHARMEX GLOBAL",
-    "ADD_1": "1037, NEW MODEL TOWN",
-    "ADD_2": "PINJORE",
-    "ADD_3": "",
-    "CITY": "PANCHKULA",
-    "STATE": "HR",
-    "COUNTRY_NAME": "India",
-    "COUNTRY_CODE": "IN",
-    "PINCODE": 134102,
-    "EMAIL": "sharmexglobal@gmail.com",
-    "MOBILE": 8629056095,
-    "KYC": "DIXPS8173N",
-    "DROP_OFF_PINCODE": 136118,
-    "PBE_TYPE": "PBEIII",
-    "PBE_FILING": "SELF",
-}
-
-EXCHANGE_RATES = {
-    "GBP": 128.0,
-    "USD": 83.5,
-    "EUR": 91.0,
-}
+# Load master catalog
+catalog_df = pd.read_excel("product_catalog.xlsx")
+# Ensure item_id is string and stripped
+catalog_df["item_id"] = catalog_df["item_id"].astype(str).str.strip()
 
 
-def clean_uk_postcode(pc):
-  if not pc or pd.isna(pc):
-    return ""
-  pc = str(pc).strip().upper().replace(" ", "")
-  if len(pc) > 4:
-    return f"{pc[:-3]} {pc[-3:]}"
-  return pc
+def lookup_product(item_num, title):
+    """Matches product by 12-digit Item Number first, then fallback to title keywords."""
+    clean_num = str(item_num).strip()
+    match = catalog_df[catalog_df["item_id"] == clean_num]
+    if not match.empty:
+        r = match.iloc[0]
+        return {
+            "hs_code": str(r.get("hs_code", "33049990")),
+            "cth_code": str(r.get("cth_code", "33049990")),
+            "hs_desc": str(r.get("hs_description", title[:28])),
+            "weight": int(r.get("weight_grams", 250)),
+            "declared_val": int(r.get("declared_value", 350)),
+        }
 
+    # Fallback to keyword matching if ID not found
+    t = str(title).lower()
+    for _, r in catalog_df.iterrows():
+        kw = str(r.get("title_keywor", "")).strip().lower()
+        if kw and kw in t:
+            return {
+                "hs_code": str(r.get("hs_code", "33049990")),
+                "cth_code": str(r.get("cth_code", "33049990")),
+                "hs_desc": str(r.get("hs_description", title[:28])),
+                "weight": int(r.get("weight_grams", 250)),
+                "declared_val": int(r.get("declared_value", 350)),
+            }
 
-def clean_phone(phone_val):
-  if not phone_val or pd.isna(phone_val):
-    return ""
-  p = str(phone_val).split(".")[0].strip()
-  p = re.sub(r"[^\d]", "", p)
-  if p.startswith("44") and len(p) > 10:
-    p = p[2:]
-  elif p.startswith("1") and len(p) > 10:
-    p = p[1:]
-  return p[-10:] if len(p) >= 10 else p
-
-
-def parse_currency_and_val(val_str):
-  if not val_str or pd.isna(val_str):
-    return "GBP", 0.0, 128.0
-  s = str(val_str).strip()
-  curr = "GBP"
-  if "$" in s:
-    curr = "USD"
-  elif "€" in s or "EUR" in s:
-    curr = "EUR"
-  elif "£" in s or "GB" in s:
-    curr = "GBP"
-
-  num_match = re.search(r"[\d]+(?:\.\d+)?", s.replace(",", ""))
-  amt = float(num_match.group()) if num_match else 0.0
-  rate = EXCHANGE_RATES.get(curr, 128.0)
-  return curr, amt, rate
-
-
-# ----------------- FILE LOADERS -----------------
-col1, col2 = st.columns(2)
-
-with col1:
-  try:
-    template_wb = openpyxl.load_workbook("template.xlsx")
-    st.success("✅ Loaded local 'template.xlsx' automatically")
-  except Exception:
-    uploaded_template = st.file_uploader(
-        "Upload template.xlsx", type=["xlsx"]
-    )
-    template_wb = (
-        openpyxl.load_workbook(uploaded_template) if uploaded_template else None
-    )
-
-with col2:
-  try:
-    catalog_df = pd.read_excel("product_catalog.xlsx", dtype=str)
-    st.success("✅ Loaded local 'product_catalog.xlsx' automatically")
-  except Exception:
-    uploaded_cat = st.file_uploader(
-        "Upload product_catalog.xlsx", type=["xlsx"]
-    )
-    catalog_df = (
-        pd.read_excel(uploaded_cat, dtype=str) if uploaded_cat else None
-    )
-
-uploaded_ebay = st.file_uploader(
-    "Upload eBay Orders CSV (Awaiting Dispatch)", type=["csv"]
-)
-
-if uploaded_ebay and template_wb and catalog_df is not None:
-  if st.button("🚀 Process & Generate Labels", type="primary"):
-    content = uploaded_ebay.getvalue().decode("utf-8-sig", errors="ignore")
-    lines = content.splitlines()
-
-    header_idx = None
-    for idx, line in enumerate(lines[:10]):
-      if "order number" in line.lower():
-        header_idx = idx
-        break
-
-    if header_idx is None:
-      st.error("Could not detect eBay Order Number header.")
-      st.stop()
-
-    raw_ebay = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])), dtype=str)
-    raw_ebay.columns = [str(c).strip() for c in raw_ebay.columns]
-
-    # Map variations between UK and US eBay export formats
-    col_map = {
-        "Order Number": "Order number",
-        "Item Title": "Item title",
-        "Item Number": "Item number",
-        "Buyer Name": "Buyer name",
-        "Ship To Name": "Post to name",
-        "Ship To Address 1": "Post to address 1",
-        "Ship To Address 2": "Post to address 2",
-        "Ship To City": "Post to city",
-        "Ship To State": "Post to county",
-        "Ship To Zip": "Post to postcode",
-        "Ship To Country": "Post to country",
-        "Ship To Phone": "Post to phone",
-        "Buyer Address 1": "Post to address 1",
-        "Buyer Address 2": "Post to address 2",
-        "Buyer City": "Post to city",
-        "Buyer State": "Post to county",
-        "Buyer Zip": "Post to postcode",
-        "Buyer Country": "Post to country",
-        "Buyer Phone": "Post to phone",
-        "Sold For": "Sold for",
+    # Safe defaults
+    return {
+        "hs_code": "33049990",
+        "cth_code": "33049990",
+        "hs_desc": str(title)[:28],
+        "weight": 250,
+        "declared_val": 350,
     }
-    for old_k, new_k in col_map.items():
-      if old_k in raw_ebay.columns and new_k not in raw_ebay.columns:
-        raw_ebay[new_k] = raw_ebay[old_k]
 
-    # Filter out non-order rows
-    order_pattern = r"^\d{2}-\d{5}-\d{5}$"
-    valid_orders = raw_ebay[
-        raw_ebay["Order number"]
-        .astype(str)
-        .str.strip()
-        .str.contains(order_pattern, regex=True)
-    ].copy()
 
-    # CRITICAL: Forward-fill address & buyer fields within each multi-item order group
-    addr_cols_to_fill = [
-        "Buyer name",
-        "Post to name",
-        "Post to address 1",
-        "Post to address 2",
-        "Post to city",
-        "Post to county",
-        "Post to postcode",
-        "Post to country",
-        "Post to phone",
+# ========================================================
+# BUILD ARTICLEDETAILS & SUBPIECES
+# ========================================================
+article_rows = []
+subpiece_rows = []
+
+# Group orders by Order Number
+order_serial = 1
+
+for order_id, order_group in valid_orders.groupby("Order number", sort=False):
+    # Filter rows that actually have an Item Title / Item Number (skipping empty transaction summary rows)
+    item_rows = order_group[
+        order_group["Item title"].fillna("").str.strip() != ""
     ]
-    for col in addr_cols_to_fill:
-      if col in valid_orders.columns:
-        valid_orders[col] = valid_orders[col].replace("", pd.NA)
-        valid_orders[col] = valid_orders.groupby("Order number")[
-            col
-        ].transform(lambda s: s.ffill().bfill())
+    if item_rows.empty:
+        item_rows = order_group.head(1)
 
-    # Now safely drop parent rows that have no item title
-    if "Item title" in valid_orders.columns:
-      valid_orders = valid_orders[
-          valid_orders["Item title"].fillna("").str.strip() != ""
-      ].copy()
+    first_row = order_group.iloc[0]
 
-    today_str = datetime.today().strftime("%Y-%m-%d")
+    order_total_weight = 0
+    order_total_declared_val = 0
+    order_subpieces = []
 
-    article_rows = []
-    subpiece_rows = []
-    serial_no = 1
+    # Loop through EVERY item in this order
+    for lsn, (_, item) in enumerate(item_rows.iterrows(), start=1):
+        # Extract item details
+        item_title = str(item.get("Item title", ""))
+        item_id = str(item.get("Item number", "")).strip()
 
-    for order_id, order_group in valid_orders.groupby("Order number", sort=False):
-      first_row = order_group.iloc[0]
+        # Parse Quantity safely
+        try:
+            qty = int(float(item.get("Quantity", 1)))
+            if qty < 1:
+                qty = 1
+        except:
+            qty = 1
 
-      dest_country_raw = str(
-          first_row.get(
-              "Post to country", first_row.get("Buyer country", "United Kingdom")
-          )
-      ).strip()
-      if pd.isna(dest_country_raw) or dest_country_raw.lower() in [
-          "nan",
-          "none",
-          "",
-      ]:
-        dest_country = "United Kingdom"
-      else:
-        dest_country = dest_country_raw
+        # Look up product in catalog
+        prod = lookup_product(item_id, item_title)
 
-      if (
-          "united kingdom" in dest_country.lower()
-          or "great britain" in dest_country.lower()
-      ):
-        country_cd = "GB"
-        dest_country = "United Kingdom"
-      elif (
-          "united states" in dest_country.lower()
-          or "usa" in dest_country.lower()
-      ):
-        country_cd = "US"
-        dest_country = "United States"
-      else:
-        country_cd = "GB"
+        # Calculate exact weights and values with Quantity
+        unit_weight = prod["weight"]
+        total_item_weight = unit_weight * qty
 
-      rec_name = str(
-          first_row.get("Post to name", first_row.get("Buyer name", ""))
-      ).strip().title()
-      rec_add1 = str(first_row.get("Post to address 1", "")).strip()
-      rec_add2 = str(first_row.get("Post to address 2", "")).strip()
-      rec_city = str(first_row.get("Post to city", "")).strip().title()
-      rec_state = str(first_row.get("Post to county", "")).strip().title()
+        unit_declared_val = prod["declared_val"]
+        total_item_declared_val = (
+            unit_declared_val * qty
+        )  # Multiplied by quantity!
 
-      raw_postcode = str(first_row.get("Post to postcode", "")).strip()
-      rec_zip = (
-          clean_uk_postcode(raw_postcode)
-          if country_cd == "GB"
-          else raw_postcode
-      )
-      rec_phone = clean_phone(first_row.get("Post to phone", ""))
+        # eBay Sold Price (for FOB value reference)
+        try:
+            sold_price_raw = str(item.get("Sold for", "0")).replace("£", "").replace("$", "").strip()
+            unit_fob = float(sold_price_raw)
+        except:
+            unit_fob = round(unit_declared_val / 128.0, 2)
+        total_fob = round(unit_fob * qty, 2)
 
-      order_weight_total = 0
-      order_val_inr_total = 0
+        order_total_weight += total_item_weight
+        order_total_declared_val += total_item_declared_val
 
-      for lsn, (_, item_row) in enumerate(order_group.iterrows(), start=1):
-        title = str(item_row.get("Item title", "")).strip()
-        item_id = str(item_row.get("Item number", "")).strip()
-        qty = int(float(item_row.get("Quantity", 1)))
-        sold_for_raw = item_row.get("Sold for", "")
+        # Append SubPiece row
+        order_subpieces.append(
+            {
+                "SERIAL NUMBER REF ": order_serial,
+                "HS CODE": prod["hs_code"],
+                "CTH CODE": prod["cth_code"],
+                "HS DESCRIPTION": prod["hs_desc"],
+                "SP UNIT CD": "PC",
+                "SP COUNT": qty,
+                "SP WEIGHT TOTAL": total_item_weight,
+                "SP NET WEIGHT": total_item_weight,
+                "SP ORIGIN COUNTRY CODE": "IN",
+                "SP ORIGIN CURRENCY CODE": "INR",
+                "SP COMM INVOICE NO": order_id,
+                "SP COM INVOICE DATE(DD-MM-YYYY)": pd.Timestamp.now().strftime(
+                    "%Y-%m-%d"
+                ),
+                "SP INVOICE LSN": lsn,
+                "SP INV CURRENCY CODE": "GBP",
+                "SP INV EXCHANGE RATE": 128,
+                "SP ASBL FOB VALUE": total_fob,
+                "SP ASBL INR VAL": total_item_declared_val,  # MUST equal total value
+                "SP TAX INVOICE NO": order_id,
+                "SP TAX INVOICE DATE": pd.Timestamp.now().strftime("%Y-%m-%d"),
+                "SP INV VALUE PU": unit_declared_val,  # Per unit
+                "SP INV VALUE TOTAL": total_item_declared_val,  # Total = Unit * Qty
+                "ecommerce_url": "Ebay.com",
+                "ecommerce_sku": item_id,
+            }
+        )
 
-        curr_code, item_price, ex_rate = parse_currency_and_val(sold_for_raw)
-        item_inr = int(round(item_price * ex_rate))
-
-        matched = None
-        for _, cat in catalog_df.iterrows():
-          cat_id = str(cat.get("item_id", "")).strip()
-          cat_kw = str(cat.get("title_keywor", "")).strip().lower()
-
-          if cat_id and cat_id in item_id:
-            matched = cat
-            break
-          elif cat_kw and cat_kw in title.lower():
-            matched = cat
-            break
-
-        if matched is not None:
-          hs_code = str(matched.get("hs_code", "33030090")).split(".")[0]
-          cth_code = str(matched.get("cth_code", hs_code)).split(".")[0]
-          hs_desc = str(matched.get("hs_description", title[:30]))
-          wt_val = int(float(matched.get("weight_grams", 250)))
-        else:
-          hs_code = "33030090"
-          cth_code = "33030090"
-          hs_desc = title[:30]
-          wt_val = 250
-
-        sp_wt = wt_val * qty
-        order_weight_total += sp_wt
-        order_val_inr_total += item_inr
-
-        subpiece_rows.append({
-            "SERIAL NUMBER REF ": serial_no,
-            "HS CODE": hs_code,
-            "CTH CODE": cth_code,
-            "HS DESCRIPTION": hs_desc,
-            "SP UNIT CD": "PC",
-            "SP COUNT": qty,
-            "SP WEIGHT TOTAL": sp_wt,
-            "SP NET WEIGHT": sp_wt,
-            "SP ORIGIN COUNTRY CODE": "IN",
-            "SP ORIGIN CURRENCY CODE": "INR",
-            "SP COMM INVOICE NO": order_id,
-            "SP COM INVOICE DATE(DD-MM-YYYY)": today_str,
-            "SP INVOICE LSN": lsn,
-            "SP INV CURRENCY CODE": curr_code,
-            "SP INV EXCHANGE RATE": int(ex_rate),
-            "SP ASBL FOB VALUE": item_price,
-            "SP ASBL INR VAL": item_inr,
-            "SP TAX INVOICE NO": order_id,
-            "SP TAX INVOICE DATE": today_str,
-            "SP INV VALUE PU": item_inr,
-            "SP INV VALUE TOTAL": item_inr,
-            "ecommerce_url": "Ebay.com",
-            "ecommerce_sku": item_id,
-        })
-
-      article_rows.append({
-          "SERIAL NUMBER": serial_no,
-          "DESTINATION COUNTRY CODE": country_cd,
-          "DESTINATION COUNTRY NAME": dest_country,
-          "MAIL NATURE TYPE": 11,
-          "MAIL TRANSPORT TYPE": "AMS",
-          "PHYSICAL WEIGHT": order_weight_total,
-          "DECLARED VALUE": order_val_inr_total,
-          "NON DELIVERY INSTRUCTIONS": "N",
-          "SENDER NAME": SENDER_DETAILS["NAME"],
-          "SENDER COMPANY": SENDER_DETAILS["COMPANY"],
-          "SENDER ADD LINE 1": SENDER_DETAILS["ADD_1"],
-          "SENDER ADD LINE 2": SENDER_DETAILS["ADD_2"],
-          "SENDER ADD LINE 3": SENDER_DETAILS["ADD_3"],
-          "SENDER CITY": SENDER_DETAILS["CITY"],
-          "SENDER STATE": SENDER_DETAILS["STATE"],
-          "SENDER COUNTRY NAME": SENDER_DETAILS["COUNTRY_NAME"],
-          "SENDER COUNTRY CODE": SENDER_DETAILS["COUNTRY_CODE"],
-          "SENDER PINCODE": SENDER_DETAILS["PINCODE"],
-          "SENDER EMAILID": SENDER_DETAILS["EMAIL"],
-          "SENDER MOBILE": SENDER_DETAILS["MOBILE"],
-          "SENDER KYC": SENDER_DETAILS["KYC"],
-          "RECEIVER NAME": rec_name,
-          "RECEIVER ADD LINE 1": rec_add1,
-          "RECEIVER ADD LINE 2": rec_add2,
-          "RECEIVER CITY": rec_city,
-          "RECEIVER STATE": rec_state,
-          "RECEIVER ZIPCODE": rec_zip,
-          "RECEIVER EMAILID": SENDER_DETAILS["EMAIL"],
-          "RECEIVER MOBILE NO": rec_phone,
-          "POD FLAG": False,
-          "PICKUP ADDRESS FLAG": False,
-          "DROP OFF PINCODE": SENDER_DETAILS["DROP_OFF_PINCODE"],
-          "PBE TYPE": SENDER_DETAILS["PBE_TYPE"],
-          "PBE FILING": SENDER_DETAILS["PBE_FILING"],
-      })
-
-      serial_no += 1
-
-    ws_art = template_wb["ArticleDetails"]
-    ws_sub = template_wb["SubPieces"]
-
-    if ws_art.max_row > 1:
-      ws_art.delete_rows(2, ws_art.max_row)
-    if ws_sub.max_row > 1:
-      ws_sub.delete_rows(2, ws_sub.max_row)
-
-    art_headers = [cell.value for cell in ws_art[1]]
-    for r in article_rows:
-      row_vals = [r.get(h, None) for h in art_headers]
-      ws_art.append(row_vals)
-
-    sub_headers = [cell.value for cell in ws_sub[1]]
-    for r in subpiece_rows:
-      row_vals = [r.get(h, None) for h in sub_headers]
-      ws_sub.append(row_vals)
-
-    output_stream = io.BytesIO()
-    template_wb.save(output_stream)
-    output_stream.seek(0)
-
-    st.success(
-        f"🎉 Successfully prepared {len(article_rows)} consignments with"
-        f" {len(subpiece_rows)} product sub-pieces!"
+    # 1 Article row per parcel/order
+    article_rows.append(
+        {
+            "SERIAL NUMBER": order_serial,
+            "ARTICLE NUMBER": np.nan,
+            "DESTINATION COUNTRY CODE": first_row.get(
+                "Country Code", "GB"
+            ),  # e.g. GB
+            "DESTINATION COUNTRY NAME": first_row.get(
+                "Country Name", "United Kingdom"
+            ),
+            "MAIL NATURE TYPE": 31,  # Sale of Goods
+            "MAIL TRANSPORT TYPE": 1,  # Air
+            "PHYSICAL WEIGHT": order_total_weight,  # Exact sum of all item weights
+            "DECLARED VALUE": order_total_declared_val,  # Exact sum of all subpiece values
+            "NON DELIVERY INSTRUCTIONS": 2,  # Return to sender
+            # Sender Details...
+            "SENDER NAME": "Vaishali Sharma",
+            "SENDER COMPANY": "Sharmex Global",
+            # Receiver Details...
+            "RECEIVER NAME": first_row.get("Buyer Name", ""),
+            "RECEIVER ADD LINE 1": first_row.get("Buyer Address 1", ""),
+            "RECEIVER ADD LINE 2": first_row.get("Buyer Address 2", ""),
+            "RECEIVER CITY": first_row.get("Buyer City", ""),
+            "RECEIVER STATE": first_row.get("Buyer State", ""),
+            "RECEIVER ZIPCODE": first_row.get("Buyer Postcode", ""),
+            "RECEIVER MOBILE NO": first_row.get("Buyer Phone", "0000000000"),
+            "PBE TYPE": 3,
+            "PBE FILING": "N",
+        }
     )
-    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    st.download_button(
-        label="📥 Download India Post Excel File",
-        data=output_stream,
-        file_name=f"IndiaPost_BulkUpload_{timestamp_str}.xlsx",
-        mime=(
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        ),
-    )
+
+    # Add all subpieces for this article
+    subpiece_rows.extend(order_subpieces)
+
+    order_serial += 1
+
+df_art_final = pd.DataFrame(article_rows)
+df_sub_final = pd.DataFrame(subpiece_rows)
