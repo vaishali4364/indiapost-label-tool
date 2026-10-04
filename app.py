@@ -13,7 +13,7 @@ st.set_page_config(
 
 st.title("📦 India Post Bulk Label Generator")
 st.caption(
-    "Automated bulk booking file creator with strict SubPiece value matching & multi-country support (UK/US)."
+    "Updated with new 78-column SubPieces template, strict invoice valuation, and dynamic UK (128) / US (96) exchange rates."
 )
 
 
@@ -228,7 +228,7 @@ def get_item_specs(title):
             "val": 210,
         }
 
-    # Safe fallback
+    # Default fallback
     return {
         "desc": str(title)[:28],
         "hs": "33049990",
@@ -246,7 +246,6 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file is not None:
     try:
-        # Read raw lines to bypass variable header metadata rows from eBay
         content = uploaded_file.getvalue().decode("utf-8-sig", errors="ignore")
         lines = content.splitlines()
 
@@ -261,11 +260,8 @@ if uploaded_file is not None:
             st.stop()
 
         df_raw = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
-
-        # Standardize column names
         df_raw.columns = [str(c).strip() for c in df_raw.columns]
 
-        # Filter real order rows (standard 14-digit eBay format XX-XXXXX-XXXXX)
         order_col = (
             "Order Number" if "Order Number" in df_raw.columns else "Order number"
         )
@@ -290,7 +286,6 @@ if uploaded_file is not None:
         for order_id, order_group in valid_orders.groupby(
             order_col, sort=False
         ):
-            # Only process rows that have an item title (skips empty total rows)
             title_col = (
                 "Item Title"
                 if "Item Title" in order_group.columns
@@ -304,7 +299,7 @@ if uploaded_file is not None:
 
             first_row = order_group.iloc[0]
 
-            # --- COUNTRY & CURRENCY DETECTION (UK vs US vs Rest) ---
+            # --- DYNAMIC COUNTRY & EXCHANGE RATE DETECTION ---
             country_raw = str(
                 first_row.get(
                     "Ship to Country",
@@ -321,7 +316,7 @@ if uploaded_file is not None:
                 dest_code = "US"
                 dest_name = "United States"
                 currency_code = "USD"
-                ex_rate = 88.0
+                ex_rate = 96.0  # Updated to 96 as requested
             else:
                 dest_code = "GB"
                 dest_name = "United Kingdom"
@@ -332,7 +327,6 @@ if uploaded_file is not None:
             parcel_total_declared_val = 0
             current_order_subpieces = []
 
-            # Process EVERY item in this order
             for lsn, (_, item) in enumerate(item_rows.iterrows(), start=1):
                 item_title = str(item.get(title_col, ""))
                 num_col = (
@@ -354,14 +348,10 @@ if uploaded_file is not None:
 
                 specs = get_item_specs(item_title)
 
-                # Unit & Line Calculations
                 item_total_weight = specs["wt"] * qty
                 unit_declared_val = specs["val"]
-                item_total_declared_val = (
-                    unit_declared_val * qty
-                )  # Multiplied by quantity
+                item_total_declared_val = unit_declared_val * qty
 
-                # Parse Sold For Price
                 sold_col = "Sold For" if "Sold For" in item.index else "Sold for"
                 try:
                     raw_p = (
@@ -379,7 +369,7 @@ if uploaded_file is not None:
                 parcel_total_weight += item_total_weight
                 parcel_total_declared_val += item_total_declared_val
 
-                # Append SubPiece Row
+                # New 78-column SubPieces row
                 current_order_subpieces.append(
                     {
                         "SERIAL NUMBER REF ": order_serial,
@@ -408,11 +398,11 @@ if uploaded_file is not None:
                         "SP INV VALUE PU": unit_declared_val,
                         "SP INV VALUE TOTAL": item_total_declared_val,
                         "ecommerce_url": "Ebay.com",
+                        "ecommerce_paytranid": np.nan,
                         "ecommerce_sku": item_id,
                     }
                 )
 
-            # Receiver Name & Address
             buyer_name = str(
                 first_row.get(
                     "Buyer Name", first_row.get("Ship To Name", "")
@@ -452,17 +442,17 @@ if uploaded_file is not None:
                 )
             ).strip()
 
-            # Append Article Row (One per parcel)
+            # New 46-column ArticleDetails row (Country Name then Code, plus INCOTERMS)
             article_rows.append(
                 {
                     "SERIAL NUMBER": order_serial,
                     "ARTICLE NUMBER": np.nan,
-                    "DESTINATION COUNTRY CODE": dest_code,
                     "DESTINATION COUNTRY NAME": dest_name,
+                    "DESTINATION COUNTRY CODE": dest_code,
                     "MAIL NATURE TYPE": 31,
                     "MAIL TRANSPORT TYPE": 1,
                     "PHYSICAL WEIGHT": parcel_total_weight,
-                    "DECLARED VALUE": parcel_total_declared_val,  # Exact sum of all subpieces
+                    "DECLARED VALUE": parcel_total_declared_val,
                     "NON DELIVERY INSTRUCTIONS": 2,
                     "SENDER NAME": "NEELA SHARMA",
                     "SENDER COMPANY": "SHARMEX GLOBAL",
@@ -486,6 +476,7 @@ if uploaded_file is not None:
                     "DROP OFF PINCODE": 136118,
                     "PBE TYPE": "PBEIII",
                     "PBE FILING": "SELF",
+                    "INCOTERMS": "DAP",
                 }
             )
 
@@ -495,59 +486,73 @@ if uploaded_file is not None:
         df_art_final = pd.DataFrame(article_rows)
         df_sub_final = pd.DataFrame(subpiece_rows)
 
-        # Build Output Excel
+        # Build Output Excel matching exact template column order
         output_buffer = io.BytesIO()
+
+        # Load column order from template.xlsx to preserve all 78 SubPiece and 46 Article columns
+        tpl_path = "template.xlsx"
+        try:
+            wb_tpl = openpyxl.load_workbook(tpl_path, data_only=True)
+            ref_art_cols = [
+                cell.value for cell in wb_tpl["ArticleDetails"][1] if cell.value
+            ]
+            ref_sub_cols = [
+                cell.value for cell in wb_tpl["SubPieces"][1] if cell.value
+            ]
+        except:
+            ref_art_cols = list(df_art_final.columns)
+            ref_sub_cols = list(df_sub_final.columns)
+
+        # Reindex to ensure strict alignment with official template headers
+        df_art_export = df_art_final.reindex(columns=ref_art_cols)
+        df_sub_export = df_sub_final.reindex(columns=ref_sub_cols)
+
         with pd.ExcelWriter(output_buffer, engine="openpyxl") as writer:
-            df_art_final.to_excel(
+            df_art_export.to_excel(
                 writer, sheet_name="ArticleDetails", index=False
             )
-            df_sub_final.to_excel(writer, sheet_name="SubPieces", index=False)
+            df_sub_export.to_excel(writer, sheet_name="SubPieces", index=False)
 
-            # Copy template meta sheets if template.xlsx exists locally
+            # Copy reference meta sheets
             try:
-                wb_tpl = openpyxl.load_workbook(
-                    "template.xlsx", data_only=True
-                )
-                for sheet in ["Information", "PickupAddress"]:
+                for sheet in ["PickupAddress", "Information"]:
                     if sheet in wb_tpl.sheetnames:
-                        df_extra = pd.read_excel(
-                            "template.xlsx", sheet_name=sheet
-                        )
+                        df_extra = pd.read_excel(tpl_path, sheet_name=sheet)
                         df_extra.to_excel(writer, sheet_name=sheet, index=False)
             except:
                 pass
 
         st.subheader("📋 Output Verification")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Total Parcels (Articles)", len(df_art_final))
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("Total Parcels (Articles)", len(df_art_export))
             st.dataframe(
-                df_art_final[
+                df_art_export[
                     [
                         "SERIAL NUMBER",
                         "RECEIVER NAME",
+                        "DESTINATION COUNTRY NAME",
                         "DESTINATION COUNTRY CODE",
                         "PHYSICAL WEIGHT",
                         "DECLARED VALUE",
                     ]
                 ]
             )
-
-        with col2:
-            st.metric("Total SubPieces", len(df_sub_final))
+        with c2:
+            st.metric("Total SubPieces", len(df_sub_export))
             st.dataframe(
-                df_sub_final[
+                df_sub_export[
                     [
                         "SERIAL NUMBER REF ",
                         "HS DESCRIPTION",
                         "SP COUNT",
-                        "SP WEIGHT TOTAL",
+                        "SP INV CURRENCY CODE",
+                        "SP INV EXCHANGE RATE",
                         "SP INV VALUE TOTAL",
                     ]
                 ]
             )
 
-        # Download button
         export_date = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
         st.download_button(
             label="📥 Download India Post Excel File",
