@@ -1,25 +1,44 @@
-import math
+import io
+import re
 import numpy as np
+import openpyxl
 import pandas as pd
+import streamlit as st
+
+st.set_page_config(
+    page_title="India Post Label Generator - Sharmex Global",
+    page_icon="📦",
+    layout="wide",
+)
+
+st.title("📦 India Post Bulk Label Generator")
+st.caption(
+    "Automated bulk booking file creator with strict SubPiece value matching & multi-country support (UK/US)."
+)
 
 
-# 1. Exact base weights (grams) and declared customs values (INR) from Sharmex Global dispatch log
-def get_exact_item_specs(title, item_id=""):
+# ========================================================
+# 1. PRODUCT SPECIFICATION & WEIGHT MAPPING ENGINE
+# ========================================================
+def get_item_specs(title):
     t = str(title).lower()
 
     # --- Fragrances & Perfumes (Bella Vita, Wild Stone, Fogg) ---
-    if any(k in t for k in ["bella vita", "bellavita", "oud", "perfume", "edp"]):
+    if any(k in t for k in ["bella vita", "bellavita", "perfume", "oud", "edp"]):
         hs = "33030040"
-        if "combo" in t or "2 pack" in t or "2 x 100ml" in t or "ceo + goat" in t:
+        if any(
+            k in t
+            for k in ["combo", "2 pack", "2 x 100ml", "ceo + goat", "ceo and goat"]
+        ):
             return {
                 "desc": "BV CEO & GOAT 100ml 2Pk",
                 "hs": hs,
                 "wt": 848,
                 "val": 700,
             }
-        if "set" in t or "4 x 20ml" in t or "4x20ml" in t:
-            if "2" in t and (
-                "pack of 2" in t or "2 bella vita" in t or "set 2" in t
+        if any(k in t for k in ["gift set", "4 x 20ml", "4x20ml", "all star"]):
+            if any(
+                k in t for k in ["pack of 2", "2 bella vita", "set 2", "set of 2"]
             ):
                 return {
                     "desc": "BV Gift Set 4x20ml 2Pk",
@@ -33,13 +52,18 @@ def get_exact_item_specs(title, item_id=""):
                 "wt": 398,
                 "val": 350,
             }
-        if (
-            "2 x 20ml" in t
-            or "2x20ml" in t
-            or "white and honey" in t
-            or "fresh + white" in t
-            or "date and senorita" in t
-            or "ceo + white" in t
+        if any(
+            k in t
+            for k in [
+                "2 x 20ml",
+                "2x20ml",
+                "white and honey",
+                "white oud & honey",
+                "fresh + white",
+                "date and senorita",
+                "ceo + white",
+                "date & glam",
+            ]
         ):
             return {
                 "desc": "BV Perfume Duo 2x20ml",
@@ -54,26 +78,19 @@ def get_exact_item_specs(title, item_id=""):
                 "wt": 98,
                 "val": 180,
             }
-        if "dark oud" in t or "oud dark" in t or "oud gold" in t:
+        if any(k in t for k in ["dark oud", "oud dark", "oud gold"]):
             return {
                 "desc": "BV Dark Oud EDP 100ml",
                 "hs": hs,
                 "wt": 498,
                 "val": 486,
             }
-        if "ceo" in t and "intense" in t:
+        if "intense" in t:
             return {
                 "desc": "BV CEO Intense EDP 100ml",
                 "hs": hs,
                 "wt": 398,
                 "val": 450,
-            }
-        if "goat" in t or "date" in t or "ceo" in t or "white oud" in t:
-            return {
-                "desc": "BV Eau De Parfum 100ml",
-                "hs": hs,
-                "wt": 398,
-                "val": 350,
             }
         return {
             "desc": "BV Eau De Parfum 100ml",
@@ -82,15 +99,15 @@ def get_exact_item_specs(title, item_id=""):
             "val": 350,
         }
 
-    # --- Skincare, Serums & Face Masks ---
-    if "detan" in t or "moroccon" in t or "face pack" in t or "sayy" in t:
+    # --- Skincare, Serums & Face Packs ---
+    if any(k in t for k in ["detan", "moroccon", "face pack", "sayy"]):
         return {
             "desc": "Sayy Moroccan DeTan Mask",
             "hs": "33049090",
             "wt": 140,
             "val": 210,
         }
-    if "elvive" in t or "serum" in t or "loreal" in t:
+    if any(k in t for k in ["elvive", "serum", "loreal paris", "biolage"]):
         if "combo" in t:
             return {
                 "desc": "Loreal Elvive Hair Combo",
@@ -104,15 +121,15 @@ def get_exact_item_specs(title, item_id=""):
             "wt": 140,
             "val": 434,
         }
-    if "gluta hya" in t or "vaseline" in t:
-        if "bundle" in t or "pack of 3" in t or "(3)" in t:
+    if any(k in t for k in ["gluta hya", "gluta-hya", "vaseline"]):
+        if any(k in t for k in ["bundle", "pack of 3", "(3)"]):
             return {
                 "desc": "Vaseline Gluta Hya 3Pk",
                 "hs": "33049090",
                 "wt": 645,
                 "val": 826,
             }
-        if "sun protect" in t or "400ml" in t:
+        if "400ml" in t or "sun protect" in t:
             return {
                 "desc": "Vaseline Body Lotion 400ml",
                 "hs": "33049090",
@@ -125,7 +142,7 @@ def get_exact_item_specs(title, item_id=""):
             "wt": 249,
             "val": 255,
         }
-    if "chemist at play" in t or "roll on" in t or "rexona" in t:
+    if any(k in t for k in ["roll on", "roll-on", "chemist at play", "rexona"]):
         return {
             "desc": "Deodorant Underarm Roll On",
             "hs": "33072000",
@@ -155,8 +172,8 @@ def get_exact_item_specs(title, item_id=""):
             "wt": 98,
             "val": 170,
         }
-    if "kiwi" in t or "cherry blossom" in t or "polish" in t:
-        if "instant" in t or "liquid" in t:
+    if any(k in t for k in ["kiwi", "cherry blossom", "shoe polish"]):
+        if any(k in t for k in ["instant", "liquid"]):
             return {
                 "desc": "Kiwi Instant Shoe Polish",
                 "hs": "34051000",
@@ -172,7 +189,7 @@ def get_exact_item_specs(title, item_id=""):
 
     # --- Copperware ---
     if "copper" in t:
-        if "pot" in t or "jug" in t:
+        if any(k in t for k in ["pot", "jug"]):
             return {
                 "desc": "Pure Copper Water Pot",
                 "hs": "74198090",
@@ -187,7 +204,7 @@ def get_exact_item_specs(title, item_id=""):
         }
 
     # --- Shaving Razors & Blades ---
-    if any(k in t for k in ["mach 3", "fusion", "vector", "guard", "razor"]):
+    if any(k in t for k in ["guard", "mach 3", "fusion", "vector", "razor"]):
         return {
             "desc": "Gillette Shaving Razor",
             "hs": "82121010",
@@ -195,15 +212,15 @@ def get_exact_item_specs(title, item_id=""):
             "val": 260,
         }
 
-    # --- Toothpaste & Toothbrushes ---
-    if "toothbrush" in t or "oral b" in t:
+    # --- Oral Care ---
+    if any(k in t for k in ["toothbrush", "oral b", "oral-b"]):
         return {
             "desc": "Oral Care Toothbrush Pack",
             "hs": "96032100",
             "wt": 98,
             "val": 213,
         }
-    if "paste" in t or "dabur" in t or "colgate" in t:
+    if any(k in t for k in ["paste", "dabur", "colgate"]):
         return {
             "desc": "Dental Toothpaste Tube",
             "hs": "33061020",
@@ -211,136 +228,333 @@ def get_exact_item_specs(title, item_id=""):
             "val": 210,
         }
 
-    # Default fallback
+    # Safe fallback
     return {
         "desc": str(title)[:28],
-        "hs": "33049090",
+        "hs": "33049990",
         "wt": 140,
         "val": 250,
     }
 
 
 # ========================================================
-# BUILD ARTICLEDETAILS & SUBPIECES ACCURATELY
+# 2. FILE UPLOADER & PROCESSING PIPELINE
 # ========================================================
-article_rows = []
-subpiece_rows = []
-order_serial = 1
+uploaded_file = st.file_uploader(
+    "Upload eBay Orders CSV Report", type=["csv"]
+)
 
-for order_id, order_group in valid_orders.groupby("Order number", sort=False):
-    # Only keep line items that have a real product title
-    item_rows = order_group[
-        order_group["Item title"].fillna("").str.strip() != ""
-    ]
-    if item_rows.empty:
-        item_rows = order_group.head(1)
+if uploaded_file is not None:
+    try:
+        # Read raw lines to bypass variable header metadata rows from eBay
+        content = uploaded_file.getvalue().decode("utf-8-sig", errors="ignore")
+        lines = content.splitlines()
 
-    first_row = order_group.iloc[0]
+        header_idx = -1
+        for i, line in enumerate(lines[:10]):
+            if "Order Number" in line or "Order number" in line:
+                header_idx = i
+                break
 
-    parcel_total_weight = 0
-    parcel_total_declared_val = 0
-    current_order_subpieces = []
+        if header_idx == -1:
+            st.error("Could not find 'Order Number' header in the CSV.")
+            st.stop()
 
-    # Process EVERY unique item in this order
-    for lsn, (_, item) in enumerate(item_rows.iterrows(), start=1):
-        item_title = str(item.get("Item title", ""))
-        item_id = str(item.get("Item number", "")).strip()
+        df_raw = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
 
-        # Parse Quantity
-        try:
-            qty = int(float(item.get("Quantity", 1)))
-            if qty < 1:
-                qty = 1
-        except:
-            qty = 1
+        # Standardize column names
+        df_raw.columns = [str(c).strip() for c in df_raw.columns]
 
-        # Get exact specs
-        specs = get_exact_item_specs(item_title, item_id)
+        # Filter real order rows (standard 14-digit eBay format XX-XXXXX-XXXXX)
+        order_col = (
+            "Order Number" if "Order Number" in df_raw.columns else "Order number"
+        )
+        valid_orders = df_raw[
+            df_raw[order_col]
+            .astype(str)
+            .str.contains(r"^\d{2}-\d{5}-\d{5}$", regex=True)
+        ].copy()
 
-        # 1. Total Weight for this line item (unit weight * quantity)
-        item_total_weight = specs["wt"] * qty
+        if valid_orders.empty:
+            st.warning("No valid eBay orders found in the uploaded file.")
+            st.stop()
 
-        # 2. Total Declared Value for this line item (unit value * quantity)
-        unit_declared_val = specs["val"]
-        item_total_declared_val = unit_declared_val * qty
-
-        # 3. FOB calculation (in GBP/USD converted or proportional)
-        try:
-            sold_price_raw = (
-                str(item.get("Sold for", "0"))
-                .replace("£", "")
-                .replace("$", "")
-                .strip()
-            )
-            unit_fob = float(sold_price_raw)
-        except:
-            unit_fob = round(unit_declared_val / 128.0, 2)
-        total_fob = round(unit_fob * qty, 2)
-
-        parcel_total_weight += item_total_weight
-        parcel_total_declared_val += item_total_declared_val
-
-        # SubPiece entry (One row per unique item line)
-        current_order_subpieces.append(
-            {
-                "SERIAL NUMBER REF ": order_serial,
-                "HS CODE": specs["hs"],
-                "CTH CODE": specs["hs"],
-                "HS DESCRIPTION": specs["desc"],
-                "SP UNIT CD": "PC",
-                "SP COUNT": qty,
-                "SP WEIGHT TOTAL": item_total_weight,  # Exact total line weight
-                "SP NET WEIGHT": item_total_weight,
-                "SP ORIGIN COUNTRY CODE": "IN",
-                "SP ORIGIN CURRENCY CODE": "INR",
-                "SP COMM INVOICE NO": order_id,
-                "SP COM INVOICE DATE(DD-MM-YYYY)": pd.Timestamp.now().strftime(
-                    "%Y-%m-%d"
-                ),
-                "SP INVOICE LSN": lsn,
-                "SP INV CURRENCY CODE": "GBP",
-                "SP INV EXCHANGE RATE": 128,
-                "SP ASBL FOB VALUE": total_fob,
-                "SP ASBL INR VAL": item_total_declared_val,  # MUST match total value
-                "SP TAX INVOICE NO": order_id,
-                "SP TAX INVOICE DATE": pd.Timestamp.now().strftime("%Y-%m-%d"),
-                "SP INV VALUE PU": unit_declared_val,  # Unit price
-                "SP INV VALUE TOTAL": item_total_declared_val,  # Total price = Unit * Qty
-                "ecommerce_url": "Ebay.com",
-                "ecommerce_sku": item_id,
-            }
+        st.success(
+            f"Found {len(valid_orders[order_col].unique())} unique orders to process!"
         )
 
-    # Article Details entry (One row per parcel)
-    article_rows.append(
-        {
-            "SERIAL NUMBER": order_serial,
-            "ARTICLE NUMBER": np.nan,
-            "DESTINATION COUNTRY CODE": first_row.get("Country Code", "GB"),
-            "DESTINATION COUNTRY NAME": first_row.get(
-                "Country Name", "United Kingdom"
-            ),
-            "MAIL NATURE TYPE": 31,
-            "MAIL TRANSPORT TYPE": 1,
-            "PHYSICAL WEIGHT": parcel_total_weight,  # Sum of all item weights
-            "DECLARED VALUE": parcel_total_declared_val,  # Exact sum of all SubPiece totals
-            "NON DELIVERY INSTRUCTIONS": 2,
-            "SENDER NAME": "Vaishali Sharma",
-            "SENDER COMPANY": "Sharmex Global",
-            "RECEIVER NAME": first_row.get("Buyer Name", ""),
-            "RECEIVER ADD LINE 1": first_row.get("Buyer Address 1", ""),
-            "RECEIVER ADD LINE 2": first_row.get("Buyer Address 2", ""),
-            "RECEIVER CITY": first_row.get("Buyer City", ""),
-            "RECEIVER STATE": first_row.get("Buyer State", ""),
-            "RECEIVER ZIPCODE": first_row.get("Buyer Postcode", ""),
-            "RECEIVER MOBILE NO": first_row.get("Buyer Phone", "0000000000"),
-            "PBE TYPE": 3,
-            "PBE FILING": "N",
-        }
-    )
+        article_rows = []
+        subpiece_rows = []
+        order_serial = 1
 
-    subpiece_rows.extend(current_order_subpieces)
-    order_serial += 1
+        for order_id, order_group in valid_orders.groupby(
+            order_col, sort=False
+        ):
+            # Only process rows that have an item title (skips empty total rows)
+            title_col = (
+                "Item Title"
+                if "Item Title" in order_group.columns
+                else "Item title"
+            )
+            item_rows = order_group[
+                order_group[title_col].fillna("").str.strip() != ""
+            ]
+            if item_rows.empty:
+                item_rows = order_group.head(1)
 
-df_art_final = pd.DataFrame(article_rows)
-df_sub_final = pd.DataFrame(subpiece_rows)
+            first_row = order_group.iloc[0]
+
+            # --- COUNTRY & CURRENCY DETECTION (UK vs US vs Rest) ---
+            country_raw = str(
+                first_row.get(
+                    "Ship to Country",
+                    first_row.get(
+                        "Country", first_row.get("Ship To Country", "")
+                    ),
+                )
+            ).strip()
+
+            if any(
+                c in country_raw.lower()
+                for c in ["us", "usa", "united states", "america"]
+            ):
+                dest_code = "US"
+                dest_name = "United States"
+                currency_code = "USD"
+                ex_rate = 88.0
+            else:
+                dest_code = "GB"
+                dest_name = "United Kingdom"
+                currency_code = "GBP"
+                ex_rate = 128.0
+
+            parcel_total_weight = 0
+            parcel_total_declared_val = 0
+            current_order_subpieces = []
+
+            # Process EVERY item in this order
+            for lsn, (_, item) in enumerate(item_rows.iterrows(), start=1):
+                item_title = str(item.get(title_col, ""))
+                num_col = (
+                    "Item Number"
+                    if "Item Number" in item.index
+                    else "Item number"
+                )
+                item_id = str(item.get(num_col, "")).strip()
+
+                qty_col = (
+                    "Quantity" if "Quantity" in item.index else "Item Quantity"
+                )
+                try:
+                    qty = int(float(item.get(qty_col, 1)))
+                    if qty < 1:
+                        qty = 1
+                except:
+                    qty = 1
+
+                specs = get_item_specs(item_title)
+
+                # Unit & Line Calculations
+                item_total_weight = specs["wt"] * qty
+                unit_declared_val = specs["val"]
+                item_total_declared_val = (
+                    unit_declared_val * qty
+                )  # Multiplied by quantity
+
+                # Parse Sold For Price
+                sold_col = "Sold For" if "Sold For" in item.index else "Sold for"
+                try:
+                    raw_p = (
+                        str(item.get(sold_col, "0"))
+                        .replace("£", "")
+                        .replace("$", "")
+                        .replace(",", "")
+                        .strip()
+                    )
+                    unit_fob = float(raw_p)
+                except:
+                    unit_fob = round(unit_declared_val / ex_rate, 2)
+                total_fob = round(unit_fob * qty, 2)
+
+                parcel_total_weight += item_total_weight
+                parcel_total_declared_val += item_total_declared_val
+
+                # Append SubPiece Row
+                current_order_subpieces.append(
+                    {
+                        "SERIAL NUMBER REF ": order_serial,
+                        "HS CODE": specs["hs"],
+                        "CTH CODE": specs["hs"],
+                        "HS DESCRIPTION": specs["desc"],
+                        "SP UNIT CD": "PC",
+                        "SP COUNT": qty,
+                        "SP WEIGHT TOTAL": item_total_weight,
+                        "SP NET WEIGHT": item_total_weight,
+                        "SP ORIGIN COUNTRY CODE": "IN",
+                        "SP ORIGIN CURRENCY CODE": "INR",
+                        "SP COMM INVOICE NO": order_id,
+                        "SP COM INVOICE DATE(DD-MM-YYYY)": pd.Timestamp.now().strftime(
+                            "%Y-%m-%d"
+                        ),
+                        "SP INVOICE LSN": lsn,
+                        "SP INV CURRENCY CODE": currency_code,
+                        "SP INV EXCHANGE RATE": int(ex_rate),
+                        "SP ASBL FOB VALUE": total_fob,
+                        "SP ASBL INR VAL": item_total_declared_val,
+                        "SP TAX INVOICE NO": order_id,
+                        "SP TAX INVOICE DATE": pd.Timestamp.now().strftime(
+                            "%Y-%m-%d"
+                        ),
+                        "SP INV VALUE PU": unit_declared_val,
+                        "SP INV VALUE TOTAL": item_total_declared_val,
+                        "ecommerce_url": "Ebay.com",
+                        "ecommerce_sku": item_id,
+                    }
+                )
+
+            # Receiver Name & Address
+            buyer_name = str(
+                first_row.get(
+                    "Buyer Name", first_row.get("Ship To Name", "")
+                )
+            ).strip()
+            add1 = str(
+                first_row.get(
+                    "Buyer Address 1", first_row.get("Ship To Address 1", "")
+                )
+            ).strip()
+            add2 = str(
+                first_row.get(
+                    "Buyer Address 2", first_row.get("Ship To Address 2", "")
+                )
+            ).strip()
+            city = str(
+                first_row.get(
+                    "Buyer City", first_row.get("Ship To City", "")
+                )
+            ).strip()
+            state = str(
+                first_row.get(
+                    "Buyer State", first_row.get("Ship To State", "")
+                )
+            ).strip()
+            zipcode = str(
+                first_row.get(
+                    "Buyer Postcode",
+                    first_row.get(
+                        "Ship To Zip", first_row.get("Ship To Postcode", "")
+                    ),
+                )
+            ).strip()
+            phone = str(
+                first_row.get(
+                    "Buyer Phone", first_row.get("Ship To Phone", "0000000000")
+                )
+            ).strip()
+
+            # Append Article Row (One per parcel)
+            article_rows.append(
+                {
+                    "SERIAL NUMBER": order_serial,
+                    "ARTICLE NUMBER": np.nan,
+                    "DESTINATION COUNTRY CODE": dest_code,
+                    "DESTINATION COUNTRY NAME": dest_name,
+                    "MAIL NATURE TYPE": 31,
+                    "MAIL TRANSPORT TYPE": 1,
+                    "PHYSICAL WEIGHT": parcel_total_weight,
+                    "DECLARED VALUE": parcel_total_declared_val,  # Exact sum of all subpieces
+                    "NON DELIVERY INSTRUCTIONS": 2,
+                    "SENDER NAME": "NEELA SHARMA",
+                    "SENDER COMPANY": "SHARMEX GLOBAL",
+                    "SENDER ADD LINE 1": "1037, NEW MODEL TOWN",
+                    "SENDER ADD LINE 2": "PINJORE",
+                    "SENDER ADD LINE 3": np.nan,
+                    "SENDER CITY": "PANCHKULA",
+                    "SENDER STATE": "HR",
+                    "SENDER COUNTRY NAME": "India",
+                    "SENDER COUNTRY CODE": "IN",
+                    "SENDER PINCODE": 134102,
+                    "SENDER EMAILID": "sharmexglobal@gmail.com",
+                    "SENDER MOBILE": 8629056095,
+                    "RECEIVER NAME": buyer_name,
+                    "RECEIVER ADD LINE 1": add1,
+                    "RECEIVER ADD LINE 2": add2,
+                    "RECEIVER CITY": city,
+                    "RECEIVER STATE": state,
+                    "RECEIVER ZIPCODE": zipcode,
+                    "RECEIVER MOBILE NO": phone if phone != "nan" else "0000000000",
+                    "DROP OFF PINCODE": 136118,
+                    "PBE TYPE": "PBEIII",
+                    "PBE FILING": "SELF",
+                }
+            )
+
+            subpiece_rows.extend(current_order_subpieces)
+            order_serial += 1
+
+        df_art_final = pd.DataFrame(article_rows)
+        df_sub_final = pd.DataFrame(subpiece_rows)
+
+        # Build Output Excel
+        output_buffer = io.BytesIO()
+        with pd.ExcelWriter(output_buffer, engine="openpyxl") as writer:
+            df_art_final.to_excel(
+                writer, sheet_name="ArticleDetails", index=False
+            )
+            df_sub_final.to_excel(writer, sheet_name="SubPieces", index=False)
+
+            # Copy template meta sheets if template.xlsx exists locally
+            try:
+                wb_tpl = openpyxl.load_workbook(
+                    "template.xlsx", data_only=True
+                )
+                for sheet in ["Information", "PickupAddress"]:
+                    if sheet in wb_tpl.sheetnames:
+                        df_extra = pd.read_excel(
+                            "template.xlsx", sheet_name=sheet
+                        )
+                        df_extra.to_excel(writer, sheet_name=sheet, index=False)
+            except:
+                pass
+
+        st.subheader("📋 Output Verification")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Total Parcels (Articles)", len(df_art_final))
+            st.dataframe(
+                df_art_final[
+                    [
+                        "SERIAL NUMBER",
+                        "RECEIVER NAME",
+                        "DESTINATION COUNTRY CODE",
+                        "PHYSICAL WEIGHT",
+                        "DECLARED VALUE",
+                    ]
+                ]
+            )
+
+        with col2:
+            st.metric("Total SubPieces", len(df_sub_final))
+            st.dataframe(
+                df_sub_final[
+                    [
+                        "SERIAL NUMBER REF ",
+                        "HS DESCRIPTION",
+                        "SP COUNT",
+                        "SP WEIGHT TOTAL",
+                        "SP INV VALUE TOTAL",
+                    ]
+                ]
+            )
+
+        # Download button
+        export_date = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+        st.download_button(
+            label="📥 Download India Post Excel File",
+            data=output_buffer.getvalue(),
+            file_name=f"IndiaPost_BulkUpload_{export_date}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    except Exception as e:
+        st.error(f"Error processing orders: {str(e)}")
