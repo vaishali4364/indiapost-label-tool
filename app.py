@@ -1,71 +1,84 @@
-import io
-import re
-import numpy as np
-import openpyxl
-import pandas as pd
-import streamlit as st
-
-st.set_page_config(
-    page_title="India Post Label Generator - Sharmex Global",
-    page_icon="📦",
-    layout="wide",
-)
-
-st.title("📦 India Post Bulk Label Generator")
-st.caption(
-    "Automated bulk booking file creator with strict SubPiece value matching, "
-    "clean phone numbers, and official 78-column template compliance."
-)
-
-
-# ========================================================
-# 1. PRODUCT SPECIFICATION & WEIGHT MAPPING ENGINE
-# ========================================================
 def get_item_specs(title):
   t = str(title).lower()
 
-  # --- Olivia Bleach ---
+  # Detect pack multiplier from title (e.g. "Pack of 2", "(2)", "2x", etc.)
+  pack_mult = 1
+  m_pack = re.search(r"pack\s*(?:of)?\s*(\d+)", t)
+  m_lead = re.match(r"^(\d+)\s+", t)
+  m_paren = re.search(r"[\(\[]\s*(\d+)\s*[\)\]]", t)
+  m_x = re.search(r"(\d+)\s*x\s*(?!20ml|100ml)", t)
+
+  if m_pack:
+    pack_mult = int(m_pack.group(1))
+  elif m_lead and int(m_lead.group(1)) in [2, 3, 4, 5, 6, 8]:
+    pack_mult = int(m_lead.group(1))
+  elif m_paren and int(m_paren.group(1)) in [2, 3, 4, 5, 6, 8]:
+    pack_mult = int(m_paren.group(1))
+  elif m_x and int(m_x.group(1)) in [2, 3, 4, 5, 6, 8]:
+    pack_mult = int(m_x.group(1))
+
+  # --- Olivia Herbal Bleach Cream ---
   if "olivia" in t and "bleach" in t:
     return {
-        "desc": "Olivia Herb Bleach 15g",
-        "hs": "33049990",
-        "wt": 49,
-        "val": 55,
+        "desc": "Olivia Herbal Bleach Cream",
+        "hs": "33049910",
+        "wt": 49 * pack_mult,
+        "val": 55 * pack_mult,
+        "is_multi": pack_mult > 1,
     }
 
-  # --- Fragrances & Perfumes (Bella Vita, Wild Stone, Fogg) ---
+  # --- Betadine Antiseptic ---
+  if "betadine" in t:
+    return {
+        "desc": "Betadine Povidone-iodine",
+        "hs": "30049099",
+        "wt": 248 if pack_mult == 2 else 140 * pack_mult,
+        "val": 90 * pack_mult,
+        "is_multi": pack_mult > 1,
+    }
+
+  # --- Fragrances & Perfumes (Bellavita, Wild Stone, Fogg) ---
   if any(k in t for k in ["bella vita", "bellavita", "perfume", "oud", "edp"]):
     hs = "33030040"
     if "intense" in t and ("ceo" in t or "100" in t):
       return {
-          "desc": "BV CEO Intense EDP 100ml",
+          "desc": "Bellavita CEO Intense 100ml",
           "hs": hs,
-          "wt": 448,  # Exactly 448g
-          "val": 450,
+          "wt": 448 * pack_mult,
+          "val": 450 * pack_mult,
+          "is_multi": pack_mult > 1,
       }
     if any(
         k in t
         for k in ["combo", "2 pack", "2 x 100ml", "ceo + goat", "ceo and goat"]
     ):
       return {
-          "desc": "BV CEO & GOAT 100ml 2Pk",
+          "desc": "Bellavita CEO & GOAT 2Pk",
           "hs": hs,
           "wt": 848,
           "val": 700,
+          "is_multi": True,
       }
     if any(k in t for k in ["gift set", "4 x 20ml", "4x20ml", "all star"]):
-      if any(k in t for k in ["pack of 2", "2 bella vita", "set 2", "set of 2"]):
+      if (
+          pack_mult == 2
+          or "pack of 2" in t
+          or "2 bella vita" in t
+          or "set 2" in t
+      ):
         return {
-            "desc": "BV Gift Set 4x20ml 2Pk",
+            "desc": "Bellavita Gift Set 4x20ml 2Pk",
             "hs": hs,
             "wt": 848,
             "val": 700,
+            "is_multi": True,
         }
       return {
-          "desc": "BV Perfume Gift Set 4x20ml",
+          "desc": "Bellavita Gift Set 4x20ml",
           "hs": hs,
           "wt": 398,
           "val": 350,
+          "is_multi": False,
       }
     if any(
         k in t
@@ -81,30 +94,34 @@ def get_item_specs(title):
         ]
     ):
       return {
-          "desc": "BV Perfume Duo 2x20ml",
+          "desc": "Bellavita Perfume Duo 2x20ml",
           "hs": hs,
           "wt": 198,
           "val": 360,
+          "is_multi": True,
       }
     if "20ml" in t:
       return {
-          "desc": "BV Pocket Perfume 20ml",
+          "desc": "Bellavita Pocket Perfume 20ml",
           "hs": hs,
-          "wt": 98,
-          "val": 180,
+          "wt": 98 * pack_mult,
+          "val": 180 * pack_mult,
+          "is_multi": pack_mult > 1,
       }
     if any(k in t for k in ["dark oud", "oud dark", "oud gold"]):
       return {
-          "desc": "BV Dark Oud EDP 100ml",
+          "desc": "Bellavita Dark Oud EDP 100ml",
           "hs": hs,
-          "wt": 498,
-          "val": 486,
+          "wt": 498 * pack_mult,
+          "val": 486 * pack_mult,
+          "is_multi": pack_mult > 1,
       }
     return {
-        "desc": "BV Eau De Parfum 100ml",
+        "desc": "Bellavita Eau De Parfum 100ml",
         "hs": hs,
-        "wt": 398,
-        "val": 350,
+        "wt": 398 * pack_mult,
+        "val": 350 * pack_mult,
+        "is_multi": pack_mult > 1,
     }
 
   # --- Skincare, Serums & Face Packs ---
@@ -112,8 +129,9 @@ def get_item_specs(title):
     return {
         "desc": "Sayy Moroccan DeTan Mask",
         "hs": "33049090",
-        "wt": 140,
-        "val": 210,
+        "wt": 140 * pack_mult,
+        "val": 210 * pack_mult,
+        "is_multi": pack_mult > 1,
     }
   if any(k in t for k in ["elvive", "serum", "loreal paris", "biolage"]):
     if "combo" in t:
@@ -122,54 +140,71 @@ def get_item_specs(title):
           "hs": "33059090",
           "wt": 548,
           "val": 506,
+          "is_multi": True,
+      }
+    if pack_mult > 1:
+      wt_map = {2: 240, 3: 348, 4: 490}
+      return {
+          "desc": "Loreal Paris Elvive Serum",
+          "hs": "33059090",
+          "wt": wt_map.get(pack_mult, 140 * pack_mult),
+          "val": 434 * pack_mult,
+          "is_multi": True,
       }
     return {
         "desc": "Loreal Paris Elvive Serum",
         "hs": "33059090",
         "wt": 140,
         "val": 434,
+        "is_multi": False,
     }
   if any(k in t for k in ["gluta hya", "gluta-hya", "vaseline"]):
-    if any(k in t for k in ["bundle", "pack of 3", "(3)"]):
+    if any(k in t for k in ["bundle", "pack of 3", "(3)"]) or pack_mult == 3:
       return {
           "desc": "Vaseline Gluta Hya 3Pk",
           "hs": "33049090",
           "wt": 645,
           "val": 826,
+          "is_multi": True,
       }
     if "400ml" in t or "sun protect" in t:
       return {
           "desc": "Vaseline Body Lotion 400ml",
           "hs": "33049090",
-          "wt": 480,
-          "val": 340,
+          "wt": 480 * pack_mult,
+          "val": 340 * pack_mult,
+          "is_multi": pack_mult > 1,
+      }
+    if pack_mult > 1:
+      return {
+          "desc": "Vaseline Gluta Hya Lotion",
+          "hs": "33049090",
+          "wt": 398 if pack_mult == 2 else 249 * pack_mult,
+          "val": 255 * pack_mult,
+          "is_multi": True,
       }
     return {
         "desc": "Vaseline Gluta Hya Lotion",
         "hs": "33049090",
         "wt": 249,
         "val": 255,
+        "is_multi": False,
     }
   if any(k in t for k in ["roll on", "roll-on", "chemist at play", "rexona"]):
     return {
         "desc": "Deodorant Underarm Roll On",
         "hs": "33072000",
-        "wt": 98,
-        "val": 291,
-    }
-  if "betadine" in t:
-    return {
-        "desc": "Betadine Antiseptic 100ml",
-        "hs": "30049099",
-        "wt": 140,
-        "val": 90,
+        "wt": 98 * pack_mult,
+        "val": 291 * pack_mult,
+        "is_multi": pack_mult > 1,
     }
   if "supradyn" in t:
     return {
         "desc": "Supradyn Multivitamin 60s",
         "hs": "21069099",
-        "wt": 98,
-        "val": 250,
+        "wt": 98 * pack_mult,
+        "val": 250 * pack_mult,
+        "is_multi": pack_mult > 1,
     }
 
   # --- Shoe Polish & Sponges ---
@@ -177,22 +212,25 @@ def get_item_specs(title):
     return {
         "desc": "Kiwi Shoe Shine Sponge",
         "hs": "34051000",
-        "wt": 98,
-        "val": 170,
+        "wt": 198 if pack_mult == 2 else 98 * pack_mult,
+        "val": 170 * pack_mult,
+        "is_multi": pack_mult > 1,
     }
   if any(k in t for k in ["kiwi", "cherry blossom", "shoe polish"]):
     if any(k in t for k in ["instant", "liquid"]):
       return {
           "desc": "Kiwi Instant Shoe Polish",
           "hs": "34051000",
-          "wt": 98,
-          "val": 106,
+          "wt": 198 if pack_mult == 2 else 98 * pack_mult,
+          "val": 106 * pack_mult,
+          "is_multi": pack_mult > 1,
       }
     return {
         "desc": "Kiwi Shoe Polish Wax Tin",
         "hs": "34051000",
-        "wt": 120,
-        "val": 106,
+        "wt": 248 if pack_mult == 2 else 120 * pack_mult,
+        "val": 106 * pack_mult,
+        "is_multi": pack_mult > 1,
     }
 
   # --- Copperware ---
@@ -203,12 +241,15 @@ def get_item_specs(title):
           "hs": "74198090",
           "wt": 326,
           "val": 945,
+          "is_multi": False,
       }
+    wt_balls = 49 if pack_mult <= 2 else (98 if pack_mult <= 4 else 198)
     return {
         "desc": "Ayurvedic Copper Ball",
         "hs": "74198090",
-        "wt": 49,
-        "val": 162,
+        "wt": wt_balls,
+        "val": 162 * (pack_mult // 2 if pack_mult > 1 else 1),
+        "is_multi": pack_mult > 1,
     }
 
   # --- Shaving Razors & Blades ---
@@ -216,8 +257,9 @@ def get_item_specs(title):
     return {
         "desc": "Gillette Shaving Razor",
         "hs": "82121010",
-        "wt": 98,
-        "val": 260,
+        "wt": 198 if pack_mult == 2 else 98 * pack_mult,
+        "val": 260 * pack_mult,
+        "is_multi": pack_mult > 1,
     }
 
   # --- Oral Care ---
@@ -225,330 +267,24 @@ def get_item_specs(title):
     return {
         "desc": "Oral Care Toothbrush Pack",
         "hs": "96032100",
-        "wt": 98,
-        "val": 213,
+        "wt": 198 if pack_mult == 2 else 98 * pack_mult,
+        "val": 213 * pack_mult,
+        "is_multi": pack_mult > 1,
     }
   if any(k in t for k in ["paste", "dabur", "colgate"]):
     return {
         "desc": "Dental Toothpaste Tube",
         "hs": "33061020",
-        "wt": 198,
-        "val": 210,
+        "wt": 198 * pack_mult,
+        "val": 210 * pack_mult,
+        "is_multi": pack_mult > 1,
     }
 
   # Default fallback
   return {
       "desc": str(title)[:28],
       "hs": "33049990",
-      "wt": 140,
-      "val": 250,
+      "wt": 140 * pack_mult,
+      "val": 250 * pack_mult,
+      "is_multi": pack_mult > 1,
   }
-
-
-# Helper function to prevent literal 'nan' strings in Excel cells
-def clean_str(val, fallback=""):
-  if pd.isna(val) or str(val).strip().lower() == "nan":
-    return fallback
-  return str(val).strip()
-
-
-# ========================================================
-# 2. FILE UPLOADER & PROCESSING PIPELINE
-# ========================================================
-uploaded_file = st.file_uploader("Upload eBay Orders CSV Report", type=["csv"])
-
-if uploaded_file is not None:
-  try:
-    content = uploaded_file.getvalue().decode("utf-8-sig", errors="ignore")
-    lines = content.splitlines()
-
-    header_idx = -1
-    for i, line in enumerate(lines[:10]):
-      if "Order Number" in line or "Order number" in line:
-        header_idx = i
-        break
-
-    if header_idx == -1:
-      st.error("Could not find 'Order Number' header in the CSV.")
-      st.stop()
-
-    df_raw = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
-    df_raw.columns = [str(c).strip() for c in df_raw.columns]
-
-    order_col = (
-        "Order Number" if "Order Number" in df_raw.columns else "Order number"
-    )
-    valid_orders = df_raw[
-        df_raw[order_col]
-        .astype(str)
-        .str.contains(r"^\d{2}-\d{5}-\d{5}$", regex=True)
-    ].copy()
-
-    if valid_orders.empty:
-      st.warning("No valid eBay orders found in the uploaded file.")
-      st.stop()
-
-    st.success(
-        f"Found {len(valid_orders[order_col].unique())} unique orders to"
-        " process!"
-    )
-
-    article_rows = []
-    subpiece_rows = []
-    order_serial = 1
-
-    for order_id, order_group in valid_orders.groupby(order_col, sort=False):
-      title_col = (
-          "Item Title" if "Item Title" in order_group.columns else "Item title"
-      )
-      item_rows = order_group[
-          order_group[title_col].fillna("").str.strip() != ""
-      ]
-      if item_rows.empty:
-        item_rows = order_group.head(1)
-
-      first_row = order_group.iloc[0]
-
-      # --- DYNAMIC COUNTRY & EXCHANGE RATE DETECTION ---
-      country_raw = str(
-          first_row.get(
-              "Ship to Country",
-              first_row.get("Country", first_row.get("Ship To Country", "")),
-          )
-      ).strip()
-
-      if any(
-          c in country_raw.lower()
-          for c in ["us", "usa", "united states", "america"]
-      ):
-        dest_code = "US"
-        dest_name = "United States of America"
-        currency_code = "USD"
-        ex_rate = 96.0  # US Rate: 96
-      else:
-        dest_code = "GB"
-        dest_name = "United Kingdom"
-        currency_code = "GBP"
-        ex_rate = 128.0  # UK Rate: 128
-
-      parcel_total_weight = 0
-      parcel_total_declared_val = 0
-      current_order_subpieces = []
-
-      # Loop over EVERY distinct item line in this order
-      for lsn, (_, item) in enumerate(item_rows.iterrows(), start=1):
-        item_title = str(item.get(title_col, ""))
-        num_col = (
-            "Item Number" if "Item Number" in item.index else "Item number"
-        )
-        item_id = str(item.get(num_col, "")).strip()
-
-        qty_col = "Quantity" if "Quantity" in item.index else "Item Quantity"
-        try:
-          qty = int(float(item.get(qty_col, 1)))
-          if qty < 1:
-            qty = 1
-        except:
-          qty = 1
-
-        specs = get_item_specs(item_title)
-
-        item_total_weight = specs["wt"] * qty
-        unit_declared_val = specs["val"]
-        item_total_declared_val = unit_declared_val * qty
-
-        sold_col = "Sold For" if "Sold For" in item.index else "Sold for"
-        try:
-          raw_p = (
-              str(item.get(sold_col, "0"))
-              .replace("£", "")
-              .replace("$", "")
-              .replace(",", "")
-              .strip()
-          )
-          unit_fob = float(raw_p)
-        except:
-          unit_fob = round(unit_declared_val / ex_rate, 2)
-        total_fob = round(unit_fob * qty, 2)
-
-        parcel_total_weight += item_total_weight
-        parcel_total_declared_val += item_total_declared_val
-
-        # SubPiece entry (78-column schema compatible)
-        current_order_subpieces.append({
-            "SERIAL NUMBER REF ": order_serial,
-            "HS CODE": specs["hs"],
-            "CTH CODE": specs["hs"],
-            "HS DESCRIPTION": specs["desc"],
-            "SP UNIT CD": "PC",
-            "SP COUNT": qty,
-            "SP WEIGHT TOTAL": item_total_weight,
-            "SP NET WEIGHT": item_total_weight,
-            "SP ORIGIN COUNTRY CODE": "IN",
-            "SP ORIGIN CURRENCY CODE": "INR",
-            "SP COMM INVOICE NO": order_id,
-            "SP COM INVOICE DATE(DD-MM-YYYY)": pd.Timestamp.now().strftime(
-                "%Y-%m-%d"
-            ),
-            "SP INVOICE LSN": lsn,
-            "SP INV CURRENCY CODE": currency_code,
-            "SP INV EXCHANGE RATE": int(ex_rate),
-            "SP ASBL FOB VALUE": total_fob,
-            "SP ASBL INR VAL": item_total_declared_val,
-            "SP TAX INVOICE NO": order_id,
-            "SP TAX INVOICE DATE": pd.Timestamp.now().strftime("%Y-%m-%d"),
-            "SP INV VALUE PU": unit_declared_val,
-            "SP INV VALUE TOTAL": item_total_declared_val,
-            "ecommerce_url": "Ebay.com",
-            "ecommerce_paytranid": np.nan,
-            "ecommerce_sku": item_id,
-        })
-
-      # Clean address fields without 'nan'
-      buyer_name = clean_str(
-          first_row.get("Buyer Name", first_row.get("Ship To Name", ""))
-      )
-      add1 = clean_str(
-          first_row.get(
-              "Buyer Address 1", first_row.get("Ship To Address 1", "")
-          )
-      )
-      add2 = clean_str(
-          first_row.get(
-              "Buyer Address 2", first_row.get("Ship To Address 2", "")
-          )
-      )
-      city = clean_str(
-          first_row.get("Buyer City", first_row.get("Ship To City", ""))
-      )
-      state = clean_str(
-          first_row.get("Buyer State", first_row.get("Ship To State", ""))
-      )
-      zipcode = clean_str(
-          first_row.get(
-              "Buyer Postcode",
-              first_row.get(
-                  "Ship To Zip", first_row.get("Ship To Postcode", "")
-              ),
-          )
-      ).upper()  # Uppercase zipcode
-
-      # PURE NUMERIC PHONE NUMBER (Removes +, spaces, dashes to prevent truncation)
-      raw_phone = clean_str(
-          first_row.get("Buyer Phone", first_row.get("Ship To Phone", ""))
-      )
-      clean_phone = re.sub(r"[^\d]", "", raw_phone)
-      if not clean_phone:
-        clean_phone = "0000000000"
-
-      # Article Details entry (46-column schema with AMS, 11, P, DAP)
-      article_rows.append({
-          "SERIAL NUMBER": order_serial,
-          "ARTICLE NUMBER": np.nan,
-          "DESTINATION COUNTRY NAME": dest_name,
-          "DESTINATION COUNTRY CODE": dest_code,
-          "MAIL NATURE TYPE": 11,  # 11 = Sale of Goods
-          "MAIL TRANSPORT TYPE": "AMS",  # AMS = Air Mail Service
-          "PHYSICAL WEIGHT": parcel_total_weight,
-          "DECLARED VALUE": parcel_total_declared_val,
-          "NON DELIVERY INSTRUCTIONS": "P",  # P = RTS - Priority
-          "SENDER NAME": "NEELA SHARMA",
-          "SENDER COMPANY": "SHARMEX GLOBAL",
-          "SENDER ADD LINE 1": "1037, NEW MODEL TOWN",
-          "SENDER ADD LINE 2": "PINJORE",
-          "SENDER ADD LINE 3": np.nan,
-          "SENDER CITY": "PANCHKULA",
-          "SENDER STATE": "HR",
-          "SENDER COUNTRY NAME": "India",
-          "SENDER COUNTRY CODE": "IN",
-          "SENDER PINCODE": 134102,
-          "SENDER EMAILID": "sharmexglobal@gmail.com",
-          "SENDER MOBILE": 8629056095,
-          "RECEIVER NAME": buyer_name,
-          "RECEIVER ADD LINE 1": add1,
-          "RECEIVER ADD LINE 2": add2 if add2 != "" else np.nan,
-          "RECEIVER CITY": city,
-          "RECEIVER STATE": state,
-          "RECEIVER ZIPCODE": zipcode,
-          "RECEIVER MOBILE NO": clean_phone,  # Pure numeric phone
-          "DROP OFF PINCODE": 136118,
-          "PBE TYPE": "PBEIII",
-          "PBE FILING": "SELF",
-          "INCOTERMS": "DAP",
-      })
-
-      subpiece_rows.extend(current_order_subpieces)
-      order_serial += 1
-
-    df_art_final = pd.DataFrame(article_rows)
-    df_sub_final = pd.DataFrame(subpiece_rows)
-
-    # Format output workbook according to template.xlsx headers
-    output_buffer = io.BytesIO()
-    tpl_path = "template.xlsx"
-    try:
-      wb_tpl = openpyxl.load_workbook(tpl_path, data_only=True)
-      ref_art_cols = [
-          cell.value for cell in wb_tpl["ArticleDetails"][1] if cell.value
-      ]
-      ref_sub_cols = [
-          cell.value for cell in wb_tpl["SubPieces"][1] if cell.value
-      ]
-    except:
-      ref_art_cols = list(df_art_final.columns)
-      ref_sub_cols = list(df_sub_final.columns)
-
-    df_art_export = df_art_final.reindex(columns=ref_art_cols)
-    df_sub_export = df_sub_final.reindex(columns=ref_sub_cols)
-
-    with pd.ExcelWriter(output_buffer, engine="openpyxl") as writer:
-      df_art_export.to_excel(writer, sheet_name="ArticleDetails", index=False)
-      df_sub_export.to_excel(writer, sheet_name="SubPieces", index=False)
-
-      try:
-        for sheet in ["PickupAddress", "Information"]:
-          if sheet in wb_tpl.sheetnames:
-            df_extra = pd.read_excel(tpl_path, sheet_name=sheet)
-            df_extra.to_excel(writer, sheet_name=sheet, index=False)
-      except:
-        pass
-
-    st.subheader("📋 Output Verification")
-    c1, c2 = st.columns(2)
-    with c1:
-      st.metric("Total Parcels (Articles)", len(df_art_export))
-      st.dataframe(
-          df_art_export[[
-              "SERIAL NUMBER",
-              "RECEIVER NAME",
-              "DESTINATION COUNTRY NAME",
-              "DESTINATION COUNTRY CODE",
-              "PHYSICAL WEIGHT",
-              "DECLARED VALUE",
-          ]]
-      )
-    with c2:
-      st.metric("Total SubPieces", len(df_sub_export))
-      st.dataframe(
-          df_sub_export[[
-              "SERIAL NUMBER REF ",
-              "HS DESCRIPTION",
-              "SP COUNT",
-              "SP INV CURRENCY CODE",
-              "SP INV EXCHANGE RATE",
-              "SP INV VALUE TOTAL",
-          ]]
-      )
-
-    export_date = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-    st.download_button(
-        label="📥 Download India Post Excel File",
-        data=output_buffer.getvalue(),
-        file_name=f"IndiaPost_BulkUpload_{export_date}.xlsx",
-        mime=(
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        ),
-    )
-
-  except Exception as e:
-    st.error(f"Error processing orders: {str(e)}")
