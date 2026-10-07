@@ -464,15 +464,41 @@ if uploaded_file is not None:
       if dest_code == "US" and "-" in zipcode:
         zipcode = zipcode.split("-")[0].strip()
 
-      raw_phone = get_field([
-          "ship to phone",
-          "shipping phone",
-          "buyer phone",
-          "buyer phone number",
-          "phone number",
-          "phone",
-      ])
-      clean_phone = re.sub(r"[^\d]", "", raw_phone)
+      # Har tarah ke eBay Phone header ko dhoondne ke liye (Ship to phone number, Buyer Phone Number, etc.)
+      raw_phone = ""
+      for k, v in row_dict.items():
+        k_norm = k.lower().replace("-", "").replace(" ", "").replace("_", "")
+        if (
+            "ship" in k_norm or "delivery" in k_norm or "recipient" in k_norm
+        ) and ("phone" in k_norm or "mobile" in k_norm or "contact" in k_norm):
+          s = clean_str(v)
+          if s and s.lower() != "nan":
+            raw_phone = s
+            break
+
+      if not raw_phone:
+        for k, v in row_dict.items():
+          k_norm = k.lower().replace("-", "").replace(" ", "").replace("_", "")
+          if (
+              "buyer" in k_norm or "customer" in k_norm or "receiver" in k_norm
+          ) and (
+              "phone" in k_norm or "mobile" in k_norm or "contact" in k_norm
+          ):
+            s = clean_str(v)
+            if s and s.lower() != "nan":
+              raw_phone = s
+              break
+
+      if not raw_phone:
+        for k, v in row_dict.items():
+          k_norm = k.lower().replace("-", "").replace(" ", "").replace("_", "")
+          if "phone" in k_norm or "mobile" in k_norm:
+            s = clean_str(v)
+            if s and s.lower() != "nan":
+              raw_phone = s
+              break
+
+      clean_phone = re.sub(r"[^\d]", "", str(raw_phone))
       if not clean_phone:
         clean_phone = "0000000000"
 
@@ -577,7 +603,7 @@ if uploaded_file is not None:
           "SENDER COUNTRY CODE": "IN",
           "SENDER PINCODE": 134102,
           "SENDER EMAILID": "sharmexglobal@gmail.com",
-          "SENDER MOBILE": 8629056095,
+          "SENDER MOBILE": "8629056095",
           "RECEIVER NAME": ship_name,
           "RECEIVER ADD LINE 1": add1,
           "RECEIVER ADD LINE 2": add2 if add2 != "" else np.nan,
