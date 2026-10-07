@@ -317,7 +317,69 @@ def get_item_specs(title):
       "hs": "33049990",
       "wt": 140 * pack_mult,
       "val": 250 * pack_mult,
-# --- ROBUST CASE-INSENSITIVE EBAY FIELD EXTRACTOR ---
+      "is_multi": pack_mult > 1,
+  }
+
+
+# ========================================================
+# 2. FILE UPLOADER & PROCESSING PIPELINE
+# ========================================================
+uploaded_file = st.file_uploader("Upload eBay Orders CSV Report", type=["csv"])
+
+if uploaded_file is not None:
+  try:
+    content = uploaded_file.getvalue().decode("utf-8-sig", errors="ignore")
+    lines = content.splitlines()
+
+    header_idx = -1
+    for i, line in enumerate(lines[:10]):
+      if "Order Number" in line or "Order number" in line:
+        header_idx = i
+        break
+
+    if header_idx == -1:
+      st.error("Could not find 'Order Number' header in the CSV.")
+      st.stop()
+
+    df_raw = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
+    df_raw.columns = [str(c).strip() for c in df_raw.columns]
+
+    order_col = (
+        "Order Number" if "Order Number" in df_raw.columns else "Order number"
+    )
+    valid_orders = df_raw[
+        df_raw[order_col]
+        .astype(str)
+        .str.contains(r"^\d{2}-\d{5}-\d{5}$", regex=True)
+    ].copy()
+
+    if valid_orders.empty:
+      st.warning("No valid eBay orders found in the uploaded file.")
+      st.stop()
+
+    st.success(
+        f"Found {len(valid_orders[order_col].unique())} unique orders to"
+        " process!"
+    )
+
+    article_rows = []
+    subpiece_rows = []
+    highlight_articles = []
+    order_serial = 1
+
+    for order_id, order_group in valid_orders.groupby(order_col, sort=False):
+      title_col = (
+          "Item Title" if "Item Title" in order_group.columns else "Item title"
+      )
+      item_rows = order_group[
+          order_group[title_col].fillna("").str.strip() != ""
+      ]
+      if item_rows.empty:
+        item_rows = order_group.head(1)
+
+      first_row = order_group.iloc[0]
+
+      # --- ROBUST CASE-INSENSITIVE EBAY FIELD EXTRACTOR ---
       row_dict = {str(k).lower().strip(): v for k, v in first_row.items()}
 
       def get_field(candidate_keys, fallback=""):
@@ -414,7 +476,6 @@ def get_item_specs(title):
       if not clean_phone:
         clean_phone = "0000000000"
 
-      
       parcel_total_weight = 0
       parcel_total_declared_val = 0
       order_is_multi = len(item_rows) > 1
@@ -491,98 +552,6 @@ def get_item_specs(title):
             "ecommerce_sku": item_id,
         })
 
-      # --- SHIP TO ADDRESS FIELDS (PRIORITIZED OVER BUYER ADDRESS) ---
-      ship_name = clean_str(
-          first_row.get(
-              "Ship To Name",
-              first_row.get(
-                  "Ship to Name",
-                  first_row.get(
-                      "Recipient Name", first_row.get("Buyer Name", "")
-                  ),
-              ),
-          )
-      )
-      add1 = clean_str(
-          first_row.get(
-              "Ship To Address 1",
-              first_row.get(
-                  "Ship to Address 1",
-                  first_row.get(
-                      "Shipping Address 1",
-                      first_row.get("Buyer Address 1", ""),
-                  ),
-              ),
-          )
-      )
-      add2 = clean_str(
-          first_row.get(
-              "Ship To Address 2",
-              first_row.get(
-                  "Ship to Address 2",
-                  first_row.get(
-                      "Shipping Address 2",
-                      first_row.get("Buyer Address 2", ""),
-                  ),
-              ),
-          )
-      )
-      city = clean_str(
-          first_row.get(
-              "Ship To City",
-              first_row.get(
-                  "Ship to City",
-                  first_row.get(
-                      "Shipping City", first_row.get("Buyer City", "")
-                  ),
-              ),
-          )
-      )
-      state = clean_str(
-          first_row.get(
-              "Ship To State",
-              first_row.get(
-                  "Ship to State",
-                  first_row.get(
-                      "Shipping State", first_row.get("Buyer State", "")
-                  ),
-              ),
-          )
-      )
-      zipcode = clean_str(
-          first_row.get(
-              "Ship To Zip",
-              first_row.get(
-                  "Ship to Zip",
-                  first_row.get(
-                      "Ship To Postcode",
-                      first_row.get(
-                          "Ship to Postcode",
-                          first_row.get(
-                              "Shipping Postcode",
-                              first_row.get("Buyer Postcode", ""),
-                          ),
-                      ),
-                  ),
-              ),
-          )
-      ).upper()
-
-      raw_phone = clean_str(
-          first_row.get(
-              "Ship To Phone",
-              first_row.get(
-                  "Ship to Phone",
-                  first_row.get(
-                      "Shipping Phone", first_row.get("Buyer Phone", "")
-                  ),
-              ),
-          )
-      )
-      clean_phone = re.sub(r"[^\d]", "", raw_phone)
-      if not clean_phone:
-        clean_phone = "0000000000"
-
       if order_is_multi:
         highlight_articles.append(order_serial)
 
@@ -627,96 +596,3 @@ def get_item_specs(title):
       order_serial += 1
 
     df_art_final = pd.DataFrame(article_rows)
-    df_sub_final = pd.DataFrame(subpiece_rows)
-
-    output_buffer = io.BytesIO()
-    tpl_path = "template.xlsx"
-    try:
-      wb_tpl = openpyxl.load_workbook(tpl_path, data_only=True)
-      ref_art_cols = [
-          cell.value for cell in wb_tpl["ArticleDetails"][1] if cell.value
-      ]
-      ref_sub_cols = [
-          cell.value for cell in wb_tpl["SubPieces"][1] if cell.value
-      ]
-    except:
-      ref_art_cols = list(df_art_final.columns)
-      ref_sub_cols = list(df_sub_final.columns)
-
-    df_art_export = df_art_final.reindex(columns=ref_art_cols)
-    df_sub_export = df_sub_final.reindex(columns=ref_sub_cols)
-
-    with pd.ExcelWriter(output_buffer, engine="openpyxl") as writer:
-      df_art_export.to_excel(writer, sheet_name="ArticleDetails", index=False)
-      df_sub_export.to_excel(writer, sheet_name="SubPieces", index=False)
-
-      try:
-        for sheet in ["PickupAddress", "Information"]:
-          if sheet in wb_tpl.sheetnames:
-            df_extra = pd.read_excel(tpl_path, sheet_name=sheet)
-            df_extra.to_excel(writer, sheet_name=sheet, index=False)
-      except:
-        pass
-
-    # Apply Pink Highlighting to PHYSICAL WEIGHT for multi-packs
-    wb_out = openpyxl.load_workbook(output_buffer)
-    ws_out_art = wb_out["ArticleDetails"]
-    pink_fill = PatternFill(
-        start_color="FFB6C1", end_color="FFB6C1", fill_type="solid"
-    )
-
-    header_cols = {
-        ws_out_art.cell(1, c).value: c
-        for c in range(1, ws_out_art.max_column + 1)
-    }
-    sno_col = header_cols.get("SERIAL NUMBER", 1)
-    wt_col = header_cols.get("PHYSICAL WEIGHT", 7)
-
-    for r in range(2, ws_out_art.max_row + 1):
-      s_val = ws_out_art.cell(r, sno_col).value
-      if s_val in highlight_articles:
-        ws_out_art.cell(r, wt_col).fill = pink_fill
-
-    final_buffer = io.BytesIO()
-    wb_out.save(final_buffer)
-
-    st.subheader("📋 Output Verification")
-    c1, c2 = st.columns(2)
-    with c1:
-      st.metric("Total Parcels (Articles)", len(df_art_export))
-      st.caption("Multi-packs are highlighted in pink in the Excel.")
-      st.dataframe(
-          df_art_export[[
-              "SERIAL NUMBER",
-              "RECEIVER NAME",
-              "DESTINATION COUNTRY NAME",
-              "DESTINATION COUNTRY CODE",
-              "PHYSICAL WEIGHT",
-              "DECLARED VALUE",
-          ]]
-      )
-    with c2:
-      st.metric("Total SubPieces", len(df_sub_export))
-      st.dataframe(
-          df_sub_export[[
-              "SERIAL NUMBER REF ",
-              "HS DESCRIPTION",
-              "SP COUNT",
-              "SP INV CURRENCY CODE",
-              "SP INV EXCHANGE RATE",
-              "SP INV VALUE TOTAL",
-          ]]
-      )
-
-    export_date = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-    st.download_button(
-        label="📥 Download India Post Excel File",
-        data=final_buffer.getvalue(),
-        file_name=f"IndiaPost_BulkUpload_{export_date}.xlsx",
-        mime=(
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        ),
-    )
-
-  except Exception as e:
-    st.error(f"Error processing orders: {str(e)}")
