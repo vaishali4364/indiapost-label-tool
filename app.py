@@ -317,79 +317,25 @@ def get_item_specs(title):
       "hs": "33049990",
       "wt": 140 * pack_mult,
       "val": 250 * pack_mult,
-      "is_multi": pack_mult > 1,
-  }
+# --- ROBUST CASE-INSENSITIVE EBAY FIELD EXTRACTOR ---
+      row_dict = {str(k).lower().strip(): v for k, v in first_row.items()}
 
+      def get_field(candidate_keys, fallback=""):
+        for k in candidate_keys:
+          val = row_dict.get(k.lower().strip())
+          s = clean_str(val)
+          if s != "":
+            return s
+        return fallback
 
-# ========================================================
-# 2. FILE UPLOADER & PROCESSING PIPELINE
-# ========================================================
-uploaded_file = st.file_uploader("Upload eBay Orders CSV Report", type=["csv"])
-
-if uploaded_file is not None:
-  try:
-    content = uploaded_file.getvalue().decode("utf-8-sig", errors="ignore")
-    lines = content.splitlines()
-
-    header_idx = -1
-    for i, line in enumerate(lines[:10]):
-      if "Order Number" in line or "Order number" in line:
-        header_idx = i
-        break
-
-    if header_idx == -1:
-      st.error("Could not find 'Order Number' header in the CSV.")
-      st.stop()
-
-    df_raw = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
-    df_raw.columns = [str(c).strip() for c in df_raw.columns]
-
-    order_col = (
-        "Order Number" if "Order Number" in df_raw.columns else "Order number"
-    )
-    valid_orders = df_raw[
-        df_raw[order_col]
-        .astype(str)
-        .str.contains(r"^\d{2}-\d{5}-\d{5}$", regex=True)
-    ].copy()
-
-    if valid_orders.empty:
-      st.warning("No valid eBay orders found in the uploaded file.")
-      st.stop()
-
-    st.success(
-        f"Found {len(valid_orders[order_col].unique())} unique orders to"
-        " process!"
-    )
-
-    article_rows = []
-    subpiece_rows = []
-    highlight_articles = []
-    order_serial = 1
-
-    for order_id, order_group in valid_orders.groupby(order_col, sort=False):
-      title_col = (
-          "Item Title" if "Item Title" in order_group.columns else "Item title"
-      )
-      item_rows = order_group[
-          order_group[title_col].fillna("").str.strip() != ""
-      ]
-      if item_rows.empty:
-        item_rows = order_group.head(1)
-
-      first_row = order_group.iloc[0]
-
-      # --- DYNAMIC COUNTRY & EXCHANGE RATE DETECTION ---
-      country_raw = str(
-          first_row.get(
-              "Ship To Country",
-              first_row.get(
-                  "Ship to Country",
-                  first_row.get("Country", first_row.get("Buyer Country", "")),
-              ),
-          )
-      ).strip()
-
+      # 1. Country & Exchange Rate
+      country_raw = get_field([
+          "ship to country",
+          "shipping country",
+          "buyer country",
+          "country",
+          "country/region",
+      ])
       if any(
           c in country_raw.lower()
           for c in ["us", "usa", "united states", "america"]
@@ -404,6 +350,71 @@ if uploaded_file is not None:
         currency_code = "GBP"
         ex_rate = 128.0
 
+      # 2. Receiver Address Fields (Handles all eBay formats)
+      ship_name = get_field([
+          "ship to name",
+          "shipping name",
+          "recipient name",
+          "buyer name",
+          "buyer full name",
+          "contact name",
+      ])
+      add1 = get_field([
+          "ship to address 1",
+          "shipping address 1",
+          "buyer address 1",
+          "delivery address 1",
+          "address 1",
+          "street 1",
+      ])
+      add2 = get_field([
+          "ship to address 2",
+          "shipping address 2",
+          "buyer address 2",
+          "delivery address 2",
+          "address 2",
+          "street 2",
+      ])
+      city = get_field(
+          ["ship to city", "shipping city", "buyer city", "city", "town"]
+      )
+      state = get_field([
+          "ship to state",
+          "shipping state",
+          "buyer state",
+          "state",
+          "province",
+          "county",
+      ])
+      zipcode = get_field([
+          "ship to zip",
+          "ship to postcode",
+          "shipping zip",
+          "shipping postcode",
+          "buyer zip",
+          "buyer postcode",
+          "postal code",
+          "postcode",
+          "zip",
+      ]).upper()
+
+      # US ZIP code: strip extension after '-' (e.g. 90210-1234 -> 90210)
+      if dest_code == "US" and "-" in zipcode:
+        zipcode = zipcode.split("-")[0].strip()
+
+      raw_phone = get_field([
+          "ship to phone",
+          "shipping phone",
+          "buyer phone",
+          "buyer phone number",
+          "phone number",
+          "phone",
+      ])
+      clean_phone = re.sub(r"[^\d]", "", raw_phone)
+      if not clean_phone:
+        clean_phone = "0000000000"
+
+      
       parcel_total_weight = 0
       parcel_total_declared_val = 0
       order_is_multi = len(item_rows) > 1
@@ -605,6 +616,7 @@ if uploaded_file is not None:
           "RECEIVER STATE": state,
           "RECEIVER ZIPCODE": zipcode,
           "RECEIVER MOBILE NO": clean_phone,
+          "BULK REF": str(order_id),
           "DROP OFF PINCODE": 136118,
           "PBE TYPE": "PBEIII",
           "PBE FILING": "SELF",
