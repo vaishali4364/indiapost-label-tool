@@ -596,3 +596,96 @@ if uploaded_file is not None:
       order_serial += 1
 
     df_art_final = pd.DataFrame(article_rows)
+    df_sub_final = pd.DataFrame(subpiece_rows)
+
+    output_buffer = io.BytesIO()
+    tpl_path = "template.xlsx"
+    try:
+      wb_tpl = openpyxl.load_workbook(tpl_path, data_only=True)
+      ref_art_cols = [
+          cell.value for cell in wb_tpl["ArticleDetails"][1] if cell.value
+      ]
+      ref_sub_cols = [
+          cell.value for cell in wb_tpl["SubPieces"][1] if cell.value
+      ]
+    except:
+      ref_art_cols = list(df_art_final.columns)
+      ref_sub_cols = list(df_sub_final.columns)
+
+    df_art_export = df_art_final.reindex(columns=ref_art_cols)
+    df_sub_export = df_sub_final.reindex(columns=ref_sub_cols)
+
+    with pd.ExcelWriter(output_buffer, engine="openpyxl") as writer:
+      df_art_export.to_excel(writer, sheet_name="ArticleDetails", index=False)
+      df_sub_export.to_excel(writer, sheet_name="SubPieces", index=False)
+
+      try:
+        for sheet in ["PickupAddress", "Information"]:
+          if sheet in wb_tpl.sheetnames:
+            df_extra = pd.read_excel(tpl_path, sheet_name=sheet)
+            df_extra.to_excel(writer, sheet_name=sheet, index=False)
+      except:
+        pass
+
+    # Apply Pink Highlighting to PHYSICAL WEIGHT for multi-packs
+    wb_out = openpyxl.load_workbook(output_buffer)
+    ws_out_art = wb_out["ArticleDetails"]
+    pink_fill = PatternFill(
+        start_color="FFB6C1", end_color="FFB6C1", fill_type="solid"
+    )
+
+    header_cols = {
+        ws_out_art.cell(1, c).value: c
+        for c in range(1, ws_out_art.max_column + 1)
+    }
+    sno_col = header_cols.get("SERIAL NUMBER", 1)
+    wt_col = header_cols.get("PHYSICAL WEIGHT", 7)
+
+    for r in range(2, ws_out_art.max_row + 1):
+      s_val = ws_out_art.cell(r, sno_col).value
+      if s_val in highlight_articles:
+        ws_out_art.cell(r, wt_col).fill = pink_fill
+
+    final_buffer = io.BytesIO()
+    wb_out.save(final_buffer)
+
+    st.subheader("📋 Output Verification")
+    c1, c2 = st.columns(2)
+    with c1:
+      st.metric("Total Parcels (Articles)", len(df_art_export))
+      st.caption("Multi-packs are highlighted in pink in the Excel.")
+      st.dataframe(
+          df_art_export[[
+              "SERIAL NUMBER",
+              "RECEIVER NAME",
+              "DESTINATION COUNTRY NAME",
+              "DESTINATION COUNTRY CODE",
+              "PHYSICAL WEIGHT",
+              "DECLARED VALUE",
+          ]]
+      )
+    with c2:
+      st.metric("Total SubPieces", len(df_sub_export))
+      st.dataframe(
+          df_sub_export[[
+              "SERIAL NUMBER REF ",
+              "HS DESCRIPTION",
+              "SP COUNT",
+              "SP INV CURRENCY CODE",
+              "SP INV EXCHANGE RATE",
+              "SP INV VALUE TOTAL",
+          ]]
+      )
+
+    export_date = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+    st.download_button(
+        label="📥 Download India Post Excel File",
+        data=final_buffer.getvalue(),
+        file_name=f"IndiaPost_BulkUpload_{export_date}.xlsx",
+        mime=(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+    )
+
+  except Exception as e:
+    st.error(f"Error processing orders: {str(e)}")
