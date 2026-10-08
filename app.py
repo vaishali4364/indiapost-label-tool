@@ -412,7 +412,7 @@ if uploaded_file is not None:
         currency_code = "GBP"
         ex_rate = 128.0
 
-      # 2. Receiver Address Fields (Handles all eBay formats)
+      # 2. Receiver Address Fields
       ship_name = get_field([
           "ship to name",
           "shipping name",
@@ -464,7 +464,7 @@ if uploaded_file is not None:
       if dest_code == "US" and "-" in zipcode:
         zipcode = zipcode.split("-")[0].strip()
 
-      # Har tarah ke eBay Phone header ko dhoondne ke liye (Ship to phone number, Buyer Phone Number, etc.)
+      # Smart Phone Number Extractor (Matches variations across eBay reports)
       raw_phone = ""
       for k, v in row_dict.items():
         k_norm = k.lower().replace("-", "").replace(" ", "").replace("_", "")
