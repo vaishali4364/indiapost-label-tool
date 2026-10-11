@@ -15,7 +15,7 @@ st.set_page_config(
 st.title("📦 India Post Bulk Label Generator")
 st.caption(
     "Automated bulk booking file creator with strict SubPiece value matching, "
-    "Ship-To address resolution, and pink-highlighted multi-packs."
+    "Ship-To address resolution, and pink/yellow highlighted parcels."
 )
 
 
@@ -365,6 +365,7 @@ if uploaded_file is not None:
     article_rows = []
     subpiece_rows = []
     highlight_articles = []
+    yellow_state_articles = []
     order_serial = 1
 
     for order_id, order_group in valid_orders.groupby(order_col, sort=False):
@@ -379,25 +380,64 @@ if uploaded_file is not None:
 
       first_row = order_group.iloc[0]
 
-      # --- ROBUST CASE-INSENSITIVE EBAY FIELD EXTRACTOR ---
-      row_dict = {str(k).lower().strip(): v for k, v in first_row.items()}
+      # Clean and normalize all keys in row (removes spaces, hyphens, slashes)
+      clean_row = {}
+      for k, v in first_row.items():
+        k_norm = re.sub(r"[^a-z0-9]", "", str(k).lower())
+        s = clean_str(v)
+        if s and s.lower() != "nan":
+          clean_row[k_norm] = s
 
-      def get_field(candidate_keys, fallback=""):
-        for k in candidate_keys:
-          val = row_dict.get(k.lower().strip())
-          s = clean_str(val)
-          if s != "":
-            return s
-        return fallback
+      # Helper that STRICTLY looks for Ship-To fields first
+      def get_field_strict(target_field):
+        ship_prefixes = [
+            "shipto",
+            "shipping",
+            "recipient",
+            "delivery",
+            "receiver",
+            "ship",
+        ]
+        buyer_prefixes = ["buyer", "customer", "user"]
+
+        suffixes_map = {
+            "name": ["name", "fullname", "contactname"],
+            "add1": ["address1", "street1", "addressline1", "add1"],
+            "add2": ["address2", "street2", "addressline2", "add2"],
+            "city": ["city", "town"],
+            "state": ["stateprovince", "state", "province", "county", "region"],
+            "zip": ["zip", "postcode", "postalcode", "zipcode"],
+            "country": ["country", "countrycode", "destinationcountry"],
+        }
+        suffixes = suffixes_map.get(target_field, [])
+
+        # Priority 1: Check Ship-To fields
+        for p in ship_prefixes:
+          for s in suffixes:
+            match_key = re.sub(r"[^a-z0-9]", "", p + s)
+            for k, val in clean_row.items():
+              if k == match_key and val:
+                return val
+
+        # Priority 2: Check Buyer fields (Fallback only)
+        for p in buyer_prefixes:
+          for s in suffixes:
+            match_key = re.sub(r"[^a-z0-9]", "", p + s)
+            for k, val in clean_row.items():
+              if k == match_key and val:
+                return val
+
+        # Priority 3: Direct key (e.g. just 'city' or 'postcode')
+        for s in suffixes:
+          match_key = re.sub(r"[^a-z0-9]", "", s)
+          for k, val in clean_row.items():
+            if k == match_key and val:
+              return val
+
+        return ""
 
       # 1. Country & Exchange Rate
-      country_raw = get_field([
-          "ship to country",
-          "shipping country",
-          "buyer country",
-          "country",
-          "country/region",
-      ])
+      country_raw = get_field_strict("country")
       if any(
           c in country_raw.lower()
           for c in ["us", "usa", "united states", "america"]
@@ -412,91 +452,46 @@ if uploaded_file is not None:
         currency_code = "GBP"
         ex_rate = 128.0
 
-      # 2. Receiver Address Fields
-      ship_name = get_field([
-          "ship to name",
-          "shipping name",
-          "recipient name",
-          "buyer name",
-          "buyer full name",
-          "contact name",
-      ])
-      add1 = get_field([
-          "ship to address 1",
-          "shipping address 1",
-          "buyer address 1",
-          "delivery address 1",
-          "address 1",
-          "street 1",
-      ])
-      add2 = get_field([
-          "ship to address 2",
-          "shipping address 2",
-          "buyer address 2",
-          "delivery address 2",
-          "address 2",
-          "street 2",
-      ])
-      city = get_field(
-          ["ship to city", "shipping city", "buyer city", "city", "town"]
-      )
-      state = get_field([
-          "ship to state",
-          "shipping state",
-          "buyer state",
-          "state",
-          "province",
-          "county",
-      ])
-      zipcode = get_field([
-          "ship to zip",
-          "ship to postcode",
-          "shipping zip",
-          "shipping postcode",
-          "buyer zip",
-          "buyer postcode",
-          "postal code",
-          "postcode",
-          "zip",
-      ]).upper()
+      # 2. Receiver Address Fields (Guaranteed Ship-To Priority)
+      ship_name = get_field_strict("name")
+      add1 = get_field_strict("add1")
+      add2 = get_field_strict("add2")
+      city = get_field_strict("city")
+      state = get_field_strict("state")
+
+      # Fallback: Agar state blank hai (jaise UK orders mein), to City use karein aur Yellow mark karein
+      if not state:
+        state = city
+        yellow_state_articles.append(order_serial)
+
+      zipcode = get_field_strict("zip").upper()
 
       # US ZIP code: strip extension after '-' (e.g. 90210-1234 -> 90210)
       if dest_code == "US" and "-" in zipcode:
         zipcode = zipcode.split("-")[0].strip()
 
-      # Smart Phone Number Extractor (Matches variations across eBay reports)
+      # Phone Extractor: Strictly checks Ship-To phone first
       raw_phone = ""
-      for k, v in row_dict.items():
-        k_norm = k.lower().replace("-", "").replace(" ", "").replace("_", "")
+      for k, v in clean_row.items():
         if (
-            "ship" in k_norm or "delivery" in k_norm or "recipient" in k_norm
-        ) and ("phone" in k_norm or "mobile" in k_norm or "contact" in k_norm):
-          s = clean_str(v)
-          if s and s.lower() != "nan":
-            raw_phone = s
+            "ship" in k or "delivery" in k or "recipient" in k
+        ) and ("phone" in k or "mobile" in k or "contact" in k or "tel" in k):
+          raw_phone = v
+          break
+
+      if not raw_phone:
+        for k, v in clean_row.items():
+          if ("buyer" in k or "customer" in k) and (
+              "phone" in k or "mobile" in k or "contact" in k or "tel" in k
+          ):
+            raw_phone = v
             break
 
       if not raw_phone:
-        for k, v in row_dict.items():
-          k_norm = k.lower().replace("-", "").replace(" ", "").replace("_", "")
-          if (
-              "buyer" in k_norm or "customer" in k_norm or "receiver" in k_norm
-          ) and (
-              "phone" in k_norm or "mobile" in k_norm or "contact" in k_norm
-          ):
-            s = clean_str(v)
-            if s and s.lower() != "nan":
-              raw_phone = s
-              break
-
-      if not raw_phone:
-        for k, v in row_dict.items():
-          k_norm = k.lower().replace("-", "").replace(" ", "").replace("_", "")
-          if "phone" in k_norm or "mobile" in k_norm:
-            s = clean_str(v)
-            if s and s.lower() != "nan":
-              raw_phone = s
-              break
+        for k, v in clean_row.items():
+          if "phone" in k or "mobile" in k or "tel" in k:
+            raw_phone = v
+            break
 
       clean_phone = re.sub(r"[^\d]", "", str(raw_phone))
       if not clean_phone:
@@ -653,11 +648,14 @@ if uploaded_file is not None:
       except:
         pass
 
-    # Apply Pink Highlighting to PHYSICAL WEIGHT for multi-packs
+    # Apply Pink Highlighting to PHYSICAL WEIGHT & Yellow Highlighting to Fallback RECEIVER STATE
     wb_out = openpyxl.load_workbook(output_buffer)
     ws_out_art = wb_out["ArticleDetails"]
     pink_fill = PatternFill(
         start_color="FFB6C1", end_color="FFB6C1", fill_type="solid"
+    )
+    yellow_fill = PatternFill(
+        start_color="FFFF00", end_color="FFFF00", fill_type="solid"
     )
 
     header_cols = {
@@ -666,11 +664,16 @@ if uploaded_file is not None:
     }
     sno_col = header_cols.get("SERIAL NUMBER", 1)
     wt_col = header_cols.get("PHYSICAL WEIGHT", 7)
+    state_col = header_cols.get("RECEIVER STATE", 31)
 
     for r in range(2, ws_out_art.max_row + 1):
       s_val = ws_out_art.cell(r, sno_col).value
+      # Multi-packs -> Pink
       if s_val in highlight_articles:
         ws_out_art.cell(r, wt_col).fill = pink_fill
+      # Blank State auto-filled with City -> Yellow
+      if s_val in yellow_state_articles:
+        ws_out_art.cell(r, state_col).fill = yellow_fill
 
     final_buffer = io.BytesIO()
     wb_out.save(final_buffer)
@@ -679,13 +682,15 @@ if uploaded_file is not None:
     c1, c2 = st.columns(2)
     with c1:
       st.metric("Total Parcels (Articles)", len(df_art_export))
-      st.caption("Multi-packs are highlighted in pink in the Excel.")
+      st.caption("Multi-packs: Pink | Fallback States: Yellow")
       st.dataframe(
           df_art_export[[
               "SERIAL NUMBER",
               "RECEIVER NAME",
               "DESTINATION COUNTRY NAME",
               "DESTINATION COUNTRY CODE",
+              "RECEIVER CITY",
+              "RECEIVER STATE",
               "PHYSICAL WEIGHT",
               "DECLARED VALUE",
           ]]
