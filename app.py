@@ -32,6 +32,7 @@ OVERRIDES_PATH = "overrides.xlsx"  # optional, lives next to app.py
 HISTORY_PATH = "order_history.csv"  # learned weights/prices, lives next to app.py
 ESTIMATED_SOURCES = ("Estimated (category)", "UNKNOWN item")
 
+RECEIVER_EMAIL = "sharmex.global@gmail.com"
 SENDER = {
     "SENDER NAME": "NEELA SHARMA",
     "SENDER COMPANY": "SHARMEX GLOBAL",
@@ -191,34 +192,75 @@ def resolve_address(group, colmap):
 
 
 _COUNTY_CACHE = {}
+LOOKUP_LOG = []   # (postcode, result_or_error) - shown in the app so you can see why a lookup failed
+UA = {"User-Agent": "SharmexLabelTool/1.0 (+eBay seller; contact sharmex.global@gmail.com)", "Accept": "application/json"}
+
+# postcodes.io gives the council district (e.g. 'Leeds'); postal addresses use the county, so map the big ones
+DISTRICT_TO_COUNTY = {}
+for _county, _ds in {
+    "West Yorkshire": "Leeds Bradford Wakefield Kirklees Calderdale",
+    "South Yorkshire": "Sheffield Doncaster Rotherham Barnsley",
+    "Greater Manchester": "Manchester Salford Bolton Bury Oldham Rochdale Stockport Tameside Trafford Wigan",
+    "West Midlands": "Birmingham Coventry Dudley Sandwell Solihull Walsall Wolverhampton",
+    "Merseyside": "Liverpool Knowsley Sefton St.Helens Wirral",
+    "Tyne and Wear": "Newcastle_upon_Tyne Gateshead North_Tyneside South_Tyneside Sunderland",
+}.items():
+    for _d in _ds.split():
+        DISTRICT_TO_COUNTY[_d.replace("_", " ").replace("St.Helens", "St. Helens").lower()] = _county
 
 
-def lookup_county(zipcode, code, timeout=6):
+def _get_json(url, timeout):
+    last = None
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(url, headers=UA)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8")), ""
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None, "postcode not found (404)"
+            last = f"HTTP {e.code}"
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
+    return None, last
+
+
+def lookup_county(zipcode, code, timeout=8):
     """Look up county/state from the postcode on the internet (free APIs, no key).
-    GB: postcodes.io  -> admin_county, else admin_district, else region
+    GB: postcodes.io (county; else council district mapped to its county; London -> Greater London)
     US: zippopotam.us -> state abbreviation
-    Returns '' if offline / not found (caller then falls back to City)."""
+    Returns '' if offline / not found (caller then falls back to City). Reasons go to LOOKUP_LOG."""
     key = (zipcode, code)
     if key in _COUNTY_CACHE:
         return _COUNTY_CACHE[key]
-    out = ""
-    try:
-        if code == "GB" and zipcode:
-            url = "https://api.postcodes.io/postcodes/" + urllib.request.quote(zipcode.replace(" ", ""))
-        elif code == "US" and re.fullmatch(r"\d{5}", zipcode or ""):
-            url = f"https://api.zippopotam.us/us/{zipcode}"
-        else:
-            return ""
-        with urllib.request.urlopen(url, timeout=timeout) as r:
-            j = json.loads(r.read().decode("utf-8"))
-        if code == "GB":
-            res = j.get("result") or {}
-            out = res.get("admin_county") or res.get("admin_district") or res.get("region") or ""
-        else:
-            out = (j.get("places") or [{}])[0].get("state abbreviation", "")
-    except Exception:
-        return ""  # do not cache failures
-    _COUNTY_CACHE[key] = out
+    out, err = "", ""
+    if code == "GB" and zipcode:
+        j, err = _get_json("https://api.postcodes.io/postcodes/" + urllib.request.quote(zipcode.replace(" ", "")), timeout)
+        res = (j or {}).get("result") or {}
+        if res:
+            dist = res.get("admin_district") or ""
+            out = (res.get("admin_county")
+                   or DISTRICT_TO_COUNTY.get(dist.lower(), "")
+                   or ("Greater London" if res.get("region") == "London" else "")
+                   or dist or res.get("region") or "")
+        elif not err:
+            err = "no result"
+        if not out and err and "404" in err:   # postcode retired/new: try its outward code
+            j2, err2 = _get_json("https://api.postcodes.io/outcodes/" + urllib.request.quote(zipcode.split(" ")[0]), timeout)
+            r2 = (j2 or {}).get("result") or {}
+            ad = (r2.get("admin_county") or [""])[0] or (r2.get("admin_district") or [""])[0]
+            if ad:
+                out = DISTRICT_TO_COUNTY.get(ad.lower(), ad)
+    elif code == "US" and re.fullmatch(r"\d{5}", zipcode or ""):
+        j, err = _get_json(f"https://api.zippopotam.us/us/{zipcode}", timeout)
+        out = ((j or {}).get("places") or [{}])[0].get("state abbreviation", "")
+        if not out and not err:
+            err = "no result"
+    else:
+        err = "unsupported country/postcode format"
+    LOOKUP_LOG.append((f"{code} {zipcode}", out or f"FAILED - {err}"))
+    if out:
+        _COUNTY_CACHE[key] = out   # failures are not cached
     return out
 
 
@@ -572,6 +614,54 @@ def friendly_name(title, label, pack, size_txt, max_len, cut_after_size=True):
     return re.sub(r"\s+", " ", out)[:max_len].strip() or clean_str(title)[:max_len]
 
 
+
+BV_CUT = re.compile(r"\||\b(?:perfumes?\s+for|long\s*lasting|premium\b|citrus|floral|woody|fruity|musky|aquatic\s+unisex|"
+                    r"fragrance|spray|eau\s+de\s+cologne|multiple\s+options|pick\s+your|intense\s+perfume|each\b)", re.I)
+BV_DROP = {"luxury", "perfume", "perfumes", "eau", "de", "parfum", "edp", "unisex", "men's", "mens", "women's",
+           "womens", "for", "of", "set", "gift", "pack", "pcs", "x", "each", "the", "new", "by", "men", "women",
+           "collection", "ml", "-", "&", "+", "and", "with", "free"}
+
+
+def bv_name(title, variation, pack, size_txt, max_len):
+    """Short, clear Bellavita name, e.g. 'BV White Oud 100ml', 'BV CEO Man + White Oud 2x20ml (2-Pack)',
+    'BV Date Woman 100ml', 'BV Gift Set 4x20ml CEO Oud Klub GOAT'."""
+    t = clean_str(title)
+    is_set = bool(re.search(r"gift\s*set|all\s*star|gourmet", t, re.I))
+    t = re.sub(r"(?i)\b(?:set|pack)\s+of\s+\d+\s*(?:x\s*\d+\s*ml)?\s*(?:each)?\s*[-:]?", " ", t)
+    t = re.sub(r"(?i)\b(?:bella\s*vita|bellavita)\b", " ", t)
+    t = re.sub(r"\([^)]*\)", " ", t)
+    t = re.sub(r"(?i)\b\d+\s*x\s*\d+\s*ml\b|\b\d+(?:\.\d+)?\s*(?:ml|l|g)\b", " ", t)
+    m = BV_CUT.search(t)
+    if m and len(t[:m.start()].split()) >= 1 and re.search(r"[A-Za-z]{3}", t[:m.start()]):
+        t = t[:m.start()]
+    t = re.sub(r"(?i)\s(?:&|and)\s", " + ", t)
+    t = t.replace("G.O.A.T", "GOAT")
+    # scent chosen in the variation (e.g. 'Select=1 Fresh 20 ml;1 Glam 20 ml')
+    var = clean_str(variation)
+    vtxt = re.sub(r"(?i)^\s*\[?\s*[a-z ]*[:=]\s*", "", var).strip(" []")
+    if vtxt and not re.search(r"(?i)pack\s*of\s*\d+", vtxt) and re.search(r"[A-Za-z]{3}", vtxt):
+        vtxt = re.sub(r"(?i)\b\d+(?:\.\d+)?\s*(?:ml|l|g)\b", " ", vtxt)
+        vtxt = re.sub(r"(?<!\w)1\s+", "", vtxt)
+        t = vtxt
+    words = []
+    drop = BV_DROP - {"perfume"} if t == vtxt else BV_DROP
+    for w in re.split(r"\s+", t):
+        wl = w.strip(".,;:-|").lower()
+        if not wl or wl in drop and w != "+":
+            continue
+        words.append("+" if w == "+" else titlecase(w.strip(".,;:-|")) if not w.isupper() or len(w) > 4 else w.strip(".,;:-|"))
+    # tidy '+' placement
+    txt = re.sub(r"\s+", " ", " ".join(words)).strip(" +")
+    txt = re.sub(r"(?:\+\s*)+$", "", txt).strip()
+    head = "BV " + (txt + " " if txt else "")
+    if is_set and "Set" not in txt:
+        head += "Set "
+    out = head + (size_txt or "")
+    if pack > 1:
+        out += f" ({pack}-Pack)"
+    return re.sub(r"\s+", " ", out).strip()[:max_len]
+
+
 # ======================================================================
 # 6. Overrides (optional, permanent corrections)
 # ======================================================================
@@ -609,8 +699,10 @@ def resolve_item(title, variation, item_id, cfg, overrides, learned=None):
     spec = tuned_rules(clean_str(title).lower(), pack)
     if spec is None:
         spec = category_specs(clean_str(title).lower(), pack, size)
-    name = friendly_name(title, spec["label"], 1 if mset else pack, size_txt, cfg["max_name"],
-                         cut_after_size=not is_bv)
+    if is_bv:
+        name = bv_name(title, variation, 1 if mset else pack, size_txt, cfg["max_name"])
+    else:
+        name = friendly_name(title, spec["label"], 1 if mset else pack, size_txt, cfg["max_name"])
     source = {"rule": "Your tuned rule", "category": "Estimated (category)", "unknown": "UNKNOWN item"}[spec["conf"]]
     hs, wt, val = spec["hs"], spec["wt"], spec["val"]
     ov = overrides.get((item_id, str(pack))) or overrides.get((item_id, ""))
@@ -802,7 +894,8 @@ def process(df, cols, cfg, overrides, learned=None):
             else:
                 state = addr["city"]
                 marks[(serial, "RECEIVER STATE")] = YELLOW
-                flags.append(("info", "County blank and lookup unavailable - City used (yellow)"))
+                why = next((r for p, r in reversed(LOOKUP_LOG) if p == f"{code} {zipcode}"), "lookup is switched off")
+                flags.append(("info", f"County blank - could not look up ({why}); City used (yellow)"))
 
         phone = re.sub(r"\D", "", addr["phone"])
         if len(phone) < 8:
@@ -846,7 +939,7 @@ def process(df, cols, cfg, overrides, learned=None):
             if qty > 1 or it["pack"] > 1:
                 multi = True
             sub_rows.append({
-                "SERIAL NUMBER REF ": serial, "HS CODE": it["hs"], "CTH CODE": it["hs"],
+                "SERIAL NUMBER REF ": serial, "HS CODE": it["hs"], "CTH CODE": hstus_code(it["hs"], code) or it["hs"],
                 "HS DESCRIPTION": it["name"], "SP UNIT CD": "PC", "SP COUNT": qty,
                 "SP WEIGHT TOTAL": tot_wt, "SP NET WEIGHT": tot_wt,
                 "SP ORIGIN COUNTRY CODE": "IN", "SP ORIGIN CURRENCY CODE": "INR",
@@ -888,7 +981,7 @@ def process(df, cols, cfg, overrides, learned=None):
             "MAIL NATURE TYPE": 11, "MAIL TRANSPORT TYPE": "AMS", "PHYSICAL WEIGHT": parcel_wt,
             "DECLARED VALUE": parcel_val, "NON DELIVERY INSTRUCTIONS": "P", "INCOTERMS": "DDP",
             **SENDER,
-            "RECEIVER NAME": addr["name"], "RECEIVER ADD LINE 1": addr["add1"],
+            "RECEIVER NAME": addr["name"], "RECEIVER EMAILID": RECEIVER_EMAIL, "RECEIVER ADD LINE 1": addr["add1"],
             "RECEIVER ADD LINE 2": addr["add2"], "RECEIVER CITY": addr["city"], "RECEIVER STATE": state,
             "RECEIVER ZIPCODE": zipcode, "RECEIVER MOBILE NO": phone, "BULK REF": order_id,
             "DROP OFF PINCODE": 136118, "PBE TYPE": "PBEIII", "PBE FILING": "SELF",
@@ -910,7 +1003,7 @@ def process(df, cols, cfg, overrides, learned=None):
 # ======================================================================
 # columns India Post's newer templates may call slightly differently
 ALIAS_KEYS = {"incoterm": "INCOTERMS", "hstus": "HSTUS CODE"}
-REQUIRED_COLS = {"ArticleDetails": ["INCOTERMS"], "SubPieces": ["HSTUS CODE"]}
+REQUIRED_COLS = {"ArticleDetails": ["INCOTERMS"], "SubPieces": []}
 
 
 def build_workbook(parcels, sub_rows, sub_marks, marks):
@@ -972,7 +1065,7 @@ def apply_edits(parcels, sub_rows, lines_df, edited):
         r = new_rows[i]
         qty = r["SP COUNT"]
         tw, tv = int(round(wt * qty)), int(round(val * qty))
-        r.update({"HS CODE": hs, "CTH CODE": hs, "HS DESCRIPTION": name, "SP WEIGHT TOTAL": tw, "SP NET WEIGHT": tw,
+        r.update({"HS CODE": hs, "CTH CODE": hstus_code(hs, o["Destination"]) or hs, "HS DESCRIPTION": name, "SP WEIGHT TOTAL": tw, "SP NET WEIGHT": tw,
                   "SP ASBL INR VAL": tv, "SP INV VALUE PU": int(round(val)), "SP INV VALUE TOTAL": tv,
                   "HSTUS CODE": hstus_code(hs, o["Destination"])})
         if o["Source"] in ESTIMATED_SOURCES and not conf:
@@ -1173,6 +1266,11 @@ def label_generator():
                              help="Length of HS DESCRIPTION. Lower it if India Post rejects long text.")
         lookup = st.checkbox("Look up missing county online", value=True,
                              help="Uses postcodes.io (UK) / zippopotam.us (US). Filled cells are sky blue - verify them.")
+        if st.button("Test county lookup", help="Checks the internet lookup with a sample UK and US postcode"):
+            for z, c in (("LS1 1AA", "GB"), ("90210", "US")):
+                _COUNTY_CACHE.pop((z, c), None)
+                r_ = lookup_county(z, c)
+                (st.success if r_ else st.error)(f"{c} {z}: " + (r_ or LOOKUP_LOG[-1][1]))
         ov_file = st.file_uploader("overrides.xlsx (optional)", type=["xlsx"],
                                    help="Your permanent corrections: item_id, pack, name, hs_code, weight_g, value_inr")
         hist_file = st.file_uploader("order_history.csv (optional)", type=["csv"],
@@ -1205,6 +1303,10 @@ def label_generator():
         cfg = {"rates": rates, "max_name": max_name, "lookup": lookup}
         parcels0, sub_rows0, sub_marks0, marks, lines_out = process(df, cols, cfg, overrides, learned)
         _, lines0 = build_report(parcels0, lines_out)
+        _bad = [x for x in LOOKUP_LOG if x[1].startswith("FAILED")]
+        if lookup and _bad:
+            st.warning(f"County lookup failed for {len(_bad)} postcode(s) - City was used instead (yellow). "
+                       f"First reason: {_bad[0][0]} -> {_bad[0][1]}")
     except Exception as e:  # noqa
         st.error(f"Error processing orders: {e}")
         raise
