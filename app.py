@@ -1,722 +1,969 @@
+"""India Post Bulk Label Generator - Sharmex Global (v2)
+
+Changes vs v1
+  * Ship-To ("Post to ...") columns are read by their real eBay names and are ALWAYS used.
+    Buyer address is only used as a flagged (red) last resort when Ship-To is completely empty.
+  * Multi-buy fixed: pack size is read from "Variation details" (e.g. [Select:Pack of 5]),
+    not only from the title; multi-line orders are merged into ONE parcel; same-address
+    orders are flagged.
+  * Product names are rebuilt as  Brand + Product + Variant + Size + Pack  (readable by anyone).
+  * Every listing now gets a proper HS code / weight (category engine), instead of a generic
+    "140 g / 33049990" fallback. Anything estimated is highlighted so you can verify it.
+  * Optional overrides.xlsx lets you permanently correct any item (HS, weight, value, name).
+  * Writes into your template.xlsx (keeps its formatting and the Information sheet) and gives
+    a separate Review Report so the upload file stays clean.
+"""
 import io
+import json
+import os
 import re
-import numpy as np
+import urllib.request
+
 import openpyxl
-from openpyxl.styles import PatternFill
 import pandas as pd
 import streamlit as st
+from openpyxl.styles import PatternFill
 
-st.set_page_config(
-    page_title="India Post Label Generator - Sharmex Global",
-    page_icon="📦",
-    layout="wide",
+TEMPLATE_PATH = "template.xlsx"
+OVERRIDES_PATH = "overrides.xlsx"  # optional, lives next to app.py
+
+SENDER = {
+    "SENDER NAME": "NEELA SHARMA",
+    "SENDER COMPANY": "SHARMEX GLOBAL",
+    "SENDER ADD LINE 1": "1037, NEW MODEL TOWN",
+    "SENDER ADD LINE 2": "PINJORE",
+    "SENDER CITY": "PANCHKULA",
+    "SENDER STATE": "HR",
+    "SENDER COUNTRY NAME": "India",
+    "SENDER COUNTRY CODE": "IN",
+    "SENDER PINCODE": 134102,
+    "SENDER EMAILID": "sharmexglobal@gmail.com",
+    "SENDER MOBILE": "8629056095",
+}
+
+DEFAULT_RATES = {"GBP": 128.0, "USD": 96.0, "CAD": 70.0, "AUD": 62.0, "EUR": 110.0}
+
+# destination text -> (code, India Post name, currency)
+COUNTRIES = {
+    "united kingdom": ("GB", "United Kingdom", "GBP"),
+    "uk": ("GB", "United Kingdom", "GBP"),
+    "great britain": ("GB", "United Kingdom", "GBP"),
+    "gb": ("GB", "United Kingdom", "GBP"),
+    "united states": ("US", "United States of America", "USD"),
+    "united states of america": ("US", "United States of America", "USD"),
+    "usa": ("US", "United States of America", "USD"),
+    "us": ("US", "United States of America", "USD"),
+    "canada": ("CA", "Canada", "CAD"),
+    "australia": ("AU", "Australia", "AUD"),
+    "germany": ("DE", "Germany", "EUR"),
+    "ireland": ("IE", "Ireland", "EUR"),
+    "france": ("FR", "France", "EUR"),
+}
+
+PINK = PatternFill("solid", start_color="FFB6C1", end_color="FFB6C1")  # multi-buy (weight)
+YELLOW = PatternFill("solid", start_color="FFFF00", end_color="FFFF00")  # state = city
+RED = PatternFill("solid", start_color="FF6B6B", end_color="FF6B6B")  # must fix
+SKY = PatternFill("solid", start_color="87CEEB", end_color="87CEEB")  # county looked up online
+ORANGE = PatternFill("solid", start_color="FFC000", end_color="FFC000")  # estimated item data
+
+
+# ======================================================================
+# helpers
+# ======================================================================
+def norm(s):
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+def clean_str(v, fallback=""):
+    if v is None:
+        return fallback
+    s = str(v).strip()
+    if s.lower() in ("nan", "none", "nat"):
+        return fallback
+    return re.sub(r"\s+", " ", s)
+
+
+def tidy_line(s):
+    return re.sub(r"[\s,;]+$", "", re.sub(r"^[\s,;]+", "", clean_str(s)))
+
+
+def money(v):
+    s = re.sub(r"[^\d.]", "", clean_str(v))
+    try:
+        return float(s) if s else 0.0
+    except ValueError:
+        return 0.0
+
+
+# ======================================================================
+# 1. CSV loading
+# ======================================================================
+def read_orders_csv(raw_bytes):
+    text = raw_bytes.decode("utf-8-sig", errors="ignore")
+    lines = text.splitlines()
+    idx = next(
+        (i for i, l in enumerate(lines[:15]) if "order number" in l.lower()), -1
+    )
+    if idx == -1:
+        raise ValueError("Could not find the 'Order number' header row in the CSV.")
+    df = pd.read_csv(
+        io.StringIO("\n".join(lines[idx:])),
+        dtype=str,
+        keep_default_na=False,
+        on_bad_lines="skip",
+    )
+    df.columns = [str(c).strip() for c in df.columns]
+    cols = {norm(c): c for c in df.columns}
+    order_col = cols.get("ordernumber")
+    title_col = cols.get("itemtitle")
+    if not order_col or not title_col:
+        raise ValueError("CSV needs 'Order number' and 'Item title' columns.")
+    # multi-item orders: rows with a title but blank order number belong to the row above
+    last = ""
+    orders = []
+    for o, t in zip(df[order_col], df[title_col]):
+        o = o.strip()
+        if o:
+            last = o
+        elif t.strip():
+            o = last
+        orders.append(o)
+    df["_order"] = orders
+    df = df[df["_order"].str.match(r"^\d{2}-\d{5}-\d{5}$")].copy()
+    df = df.drop_duplicates()
+    return df, cols
+
+
+# ======================================================================
+# 2. Ship-To resolution  (the part that used to break)
+# ======================================================================
+SHIP_PREFIXES = ["postto", "shipto", "shipping", "ship", "recipient", "delivery"]
+FIELD_SUFFIX = {
+    "name": ["name", "fullname"],
+    "phone": ["phone", "mobile", "phonenumber", "contactphone"],
+    "add1": ["address1", "addressline1", "street1", "add1"],
+    "add2": ["address2", "addressline2", "street2", "add2"],
+    "city": ["city", "town"],
+    "state": ["state", "county", "stateprovince", "province", "region"],
+    "zip": ["postcode", "zip", "zipcode", "postalcode"],
+    "country": ["country", "countrycode"],
+}
+
+
+def candidates(prefixes, field):
+    return [p + s for p in prefixes for s in FIELD_SUFFIX[field]]
+
+
+def first_nonblank(group, colmap, keys):
+    """colmap: norm(col)->col. Scan EVERY row of the order (not just the first)."""
+    for k in keys:
+        col = colmap.get(k)
+        if not col:
+            continue
+        for v in group[col]:
+            v = clean_str(v)
+            if v:
+                return v
+    return ""
+
+
+def resolve_address(group, colmap):
+    fields = ["name", "phone", "add1", "add2", "city", "state", "zip", "country"]
+    ship = {f: first_nonblank(group, colmap, candidates(SHIP_PREFIXES, f)) for f in fields}
+    buyer = {f: first_nonblank(group, colmap, candidates(["buyer"], f)) for f in fields}
+    ship_has_block = bool(ship["name"] or ship["add1"] or ship["zip"])
+    if ship_has_block:
+        addr, source = ship, "ship"
+        # same-block rule: never mix buyer fields into a ship-to address,
+        # except phone (buyer phone is only used if ship-to phone is missing)
+        if not addr["phone"]:
+            addr = {**addr, "phone": buyer["phone"]}
+    else:
+        addr, source = buyer, "buyer"
+    for k in ("name", "add1", "add2", "city", "state"):
+        addr[k] = tidy_line(addr[k])
+    return addr, source, ship, buyer
+
+
+_COUNTY_CACHE = {}
+
+
+def lookup_county(zipcode, code, timeout=6):
+    """Look up county/state from the postcode on the internet (free APIs, no key).
+    GB: postcodes.io  -> admin_county, else admin_district, else region
+    US: zippopotam.us -> state abbreviation
+    Returns '' if offline / not found (caller then falls back to City)."""
+    key = (zipcode, code)
+    if key in _COUNTY_CACHE:
+        return _COUNTY_CACHE[key]
+    out = ""
+    try:
+        if code == "GB" and zipcode:
+            url = "https://api.postcodes.io/postcodes/" + urllib.request.quote(zipcode.replace(" ", ""))
+        elif code == "US" and re.fullmatch(r"\d{5}", zipcode or ""):
+            url = f"https://api.zippopotam.us/us/{zipcode}"
+        else:
+            return ""
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            j = json.loads(r.read().decode("utf-8"))
+        if code == "GB":
+            res = j.get("result") or {}
+            out = res.get("admin_county") or res.get("admin_district") or res.get("region") or ""
+        else:
+            out = (j.get("places") or [{}])[0].get("state abbreviation", "")
+    except Exception:
+        return ""  # do not cache failures
+    _COUNTY_CACHE[key] = out
+    return out
+
+
+def norm_postcode(z, code):
+    z = clean_str(z).upper()
+    if code == "US":
+        return z.split("-")[0].strip()
+    if code == "GB":
+        compact = re.sub(r"\s+", "", z)
+        if len(compact) >= 5:
+            return compact[:-3] + " " + compact[-3:]
+    return z
+
+
+# ======================================================================
+# 3. Pack / size parsing
+# ======================================================================
+def variation_pack(var):
+    """'[Select:Pack of 5]' / 'Pack=2' / 'Select=5 Black' / 'MPN:Pack of 10' -> int or None"""
+    var = clean_str(var).strip("[] ")
+    if not var:
+        return None
+    for part in re.split(r"[;,]", var):
+        _, _, v = part.partition(":") if ":" in part else part.partition("=")
+        v = v.strip()
+        m = re.search(r"pack\s*of\s*(\d+)", v, re.I) or re.search(r"(\d+)\s*[- ]?pack\b", v, re.I)
+        if m:
+            return int(m.group(1))
+        if re.fullmatch(r"\d{1,2}", v):
+            return int(v)
+        m = re.match(r"(\d{1,2})\s+(?!ml\b|g\b|gm\b|kg\b|oz\b|l\b)[a-z]", v, re.I)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def title_pack(title, allow_x=True):
+    t = clean_str(title).lower()
+    mult = 1
+    m = re.match(r"^\s*(\d+)\s*x\s*(?=(?:pack|set|box)\s*of)", t)
+    if m:
+        mult = int(m.group(1))
+    nums = []
+    pats = [
+        r"(?:packs?|set|box|bundle|combo|lot)\s*of\s*(\d+)",
+        r"\((\d+)\s*total\)",
+        r"\b(\d+)\s*[- ]?\s*(?:pack|pcs|pieces|pc|pk)\b",
+    ]
+    if allow_x:
+        pats += [
+            r"\bx\s*(\d+)\b(?!\s*(?:ml|g|gm|kg|gram|l\b))",
+            r"(?<![\d.])(\d+)\s*x\s*(?=\d+(?:\.\d+)?\s*(?:ml|g|gm|kg))",
+        ]
+    for p in pats:
+        nums += [int(x) for x in re.findall(p, t)]
+    if "twin pack" in t:
+        nums.append(2)
+    for a, b in re.findall(r"(\d+)\s*packs?\s*of\s*(\d+)", t):
+        nums.append(int(a) * int(b))
+    m = re.match(r"^\s*(\d+)\s+(?=[a-z])(?!ml|g\b|gm|kg|in\b)", t)
+    if m and 2 <= int(m.group(1)) <= 12:
+        nums.append(int(m.group(1)))
+    n = max(nums) if nums else 1
+    return max(1, min(mult * n, 60))
+
+
+def detect_pack(title, variation):
+    v = variation_pack(variation)
+    if v:
+        return max(1, min(v, 60)), "variation"
+    return title_pack(title), "title"
+
+
+SIZE_RE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)(?:\s*(kg|gms?|grams?|g|ml|ltr)|(l))(?![a-z'’])", re.I)
+
+
+def parse_size(title):
+    """returns (grams_or_ml_total, display_text) ; sums '340ml & Conditioner 180ml' sets"""
+    t = clean_str(title)
+    ms = list(SIZE_RE.finditer(t))
+    if not ms:
+        return 0.0, ""
+
+    def val(m):
+        v = float(m.group(1))
+        return v * 1000 if (m.group(2) or "l").lower() in ("kg", "ltr", "l") else v
+
+    def txt(m):
+        n = m.group(1).rstrip("0").rstrip(".") if "." in m.group(1) else m.group(1)
+        u = (m.group(2) or "l").lower()
+        u = "g" if u.startswith("g") else u
+        return f"{n}{u}"
+
+    total, shown = val(ms[0]), txt(ms[0])
+    if len(ms) > 1:
+        between = t[ms[0].end():ms[1].start()]
+        if re.fullmatch(r"\s*(?:&|\+|and)\s*(?:[A-Za-z ]{0,20})?\s*", between):
+            total += val(ms[1])
+            shown += "+" + txt(ms[1])
+    return total, shown
+
+
+# ======================================================================
+# 4. Product specs: rules (your tuned numbers) -> categories -> unknown
+# ======================================================================
+def S(label, desc, hs, wt, val, conf="rule"):
+    return {"label": label, "desc": desc, "hs": hs, "wt": wt, "val": val, "conf": conf}
+
+
+def tuned_rules(t, pack):
+    """Your original hand-tuned weights/values. t = lower-case title."""
+    if "olivia" in t and "bleach" in t:
+        return S("Bleach Cream", "Olivia Herbal Bleach Cream", "33049910", 49 * pack, 55 * pack)
+    if "betadine" in t:
+        return S("Antiseptic", "Betadine Povidone-iodine", "30049099",
+                 248 if pack == 2 else 140 * pack, 90 * pack)
+    if "bella vita" in t or "bellavita" in t:
+        hs = "33030040"
+        bp = title_pack(t, allow_x=False)
+        if "intense" in t and ("ceo" in t or "100" in t):
+            return S("EDP", "Bellavita CEO Intense 100ml", hs, 448 * bp, 450 * bp)
+        if any(k in t for k in ["combo", "2 pack", "2 x 100ml", "ceo + goat", "ceo and goat"]):
+            return S("EDP Combo", "Bellavita CEO & GOAT 2Pk", hs, 848, 700)
+        if any(k in t for k in ["gift set", "4 x 20ml", "4x20ml", "all star"]):
+            if bp == 2 or "pack of 2" in t or "2 bella vita" in t or "set 2" in t:
+                return S("Gift Set", "Bellavita Gift Set 4x20ml 2Pk", hs, 848, 700)
+            return S("Gift Set", "Bellavita Gift Set 4x20ml", hs, 398, 350)
+        if any(k in t for k in ["2 x 20ml", "2x20ml", "white and honey", "white oud & honey",
+                                "fresh + white", "date and senorita", "ceo + white", "date & glam"]):
+            return S("Perfume Duo", "Bellavita Perfume Duo 2x20ml", hs, 198, 360)
+        if "20ml" in t:
+            return S("Perfume", "Bellavita Pocket Perfume 20ml", hs, 98 * bp, 180 * bp)
+        if any(k in t for k in ["dark oud", "oud dark", "oud gold"]):
+            return S("EDP", "Bellavita Dark Oud EDP 100ml", hs, 498 * bp, 486 * bp)
+        return S("EDP", "Bellavita Eau De Parfum 100ml", hs, 398 * bp, 350 * bp)
+    if any(k in t for k in ["detan", "moroccon", "face pack"]):
+        return S("De-Tan Mask", "Sayy Moroccan DeTan Mask", "33049090", 140 * pack, 210 * pack)
+    if "elvive" in t or "biolage" in t:
+        if "combo" in t:
+            return S("Hair Combo", "Loreal Elvive Hair Combo", "33059090", 548, 506)
+        wt = {2: 240, 3: 348, 4: 490}.get(pack, 140 * pack) if pack > 1 else 140
+        return S("Hair Serum", "Loreal Paris Elvive Serum", "33059090", wt, 434 * pack)
+    if any(k in t for k in ["gluta hya", "gluta-hya", "vaseline"]) and "lip" not in t:
+        if any(k in t for k in ["bundle", "pack of 3", "(3)"]) or pack == 3:
+            return S("Body Lotion", "Vaseline Gluta Hya 3Pk", "33049090", 645, 826)
+        if "400ml" in t or "sun protect" in t:
+            return S("Body Lotion", "Vaseline Body Lotion 400ml", "33049090", 480 * pack, 340 * pack)
+        if pack > 1:
+            return S("Body Lotion", "Vaseline Gluta Hya Lotion", "33049090",
+                     398 if pack == 2 else 249 * pack, 255 * pack)
+        return S("Body Lotion", "Vaseline Gluta Hya Lotion", "33049090", 249, 255)
+    if ("serum" not in t and any(k in t for k in ["roll on", "roll-on", "rexona"])) or (
+        "chemist at play" in t and ("roll" in t or "deodorant" in t)
+    ):
+        return S("Roll-On Deodorant", "Deodorant Underarm Roll On", "33072000", 98 * pack, 291 * pack)
+    if "supradyn" in t:
+        return S("Multivitamin", "Supradyn Multivitamin 60s", "21069099", 98 * pack, 250 * pack)
+    if "sponge" in t:
+        return S("Shoe Shine Sponge", "Kiwi Shoe Shine Sponge", "34051000",
+                 198 if pack == 2 else 98 * pack, 170 * pack)
+    if any(k in t for k in ["kiwi", "cherry blossom", "shoe polish"]):
+        if any(k in t for k in ["instant", "liquid"]):
+            return S("Shoe Polish", "Kiwi Instant Shoe Polish", "34051000",
+                     198 if pack == 2 else 98 * pack, 106 * pack)
+        return S("Shoe Polish", "Kiwi Shoe Polish Wax Tin", "34051000",
+                 248 if pack == 2 else 120 * pack, 106 * pack)
+    if "copper" in t:
+        if any(k in t for k in ["pot", "jug"]):
+            return S("Copper Water Pot", "Pure Copper Water Pot", "74198090", 326, 945)
+        if "ball" in t:
+            wt = 49 if pack <= 2 else (98 if pack <= 4 else 198)
+            return S("Copper Ball", "Ayurvedic Copper Ball", "74198090", wt,
+                     162 * (pack // 2 if pack > 1 else 1))
+    if any(k in t for k in ["guard", "mach 3", "fusion", "vector", "razor"]):
+        return S("Shaving Razor", "Gillette Shaving Razor", "82121010",
+                 198 if pack == 2 else 98 * pack, 260 * pack)
+    if any(k in t for k in ["toothbrush", "oral b", "oral-b"]):
+        return S("Toothbrush", "Oral Care Toothbrush Pack", "96032100",
+                 198 if pack == 2 else 98 * pack, 213 * pack)
+    if "toothpaste" in t or "tooth paste" in t or "colgate" in t or ("dabur" in t and "paste" in t):
+        return S("Toothpaste", "Dental Toothpaste Tube", "33061020", 198 * pack, 210 * pack)
+    return None
+
+
+# (regex, label, HS, default_wt_g, weight_from_size, value_inr_per_unit)
+# HS codes below are best-effort defaults - items matched here are highlighted ORANGE for you to verify.
+CATEGORIES = [
+    (r"\bmoov\b", "Pain Relief Cream", "30049011", 90, True, 220),
+    (r"tata tea|black tea", "Black Tea", "09024020", 540, True, 250),
+    (r"\bhing\b|asafoetida", "Asafoetida (Hing) Powder", "13019013", 80, True, 150),
+    (r"dant manjan|tooth ?powder", "Tooth Powder", "33061090", 130, True, 150),
+    (r"copper.*bottle|bottle.*copper", "Copper Water Bottle", "74198090", 350, False, 800),
+    (r"bleach", "Bleach Cream", "33049910", 60, True, 100),
+    (r"copper.*glass|drinking glass|tumbler", "Copper Drinking Glass", "74198090", 150, False, 400),
+    (r"copper", "Copper Utensil", "74198090", 300, False, 500),
+    (r"toner", "Face Toner", "33049990", 120, True, 300),
+    (r"incense|agarbatti|dhoop", "Incense Sticks", "33074100", 100, False, 150),
+    (r"air freshener|freshener|\bglade\b|godrej aer", "Air Freshener", "33074900", 60, False, 150),
+    (r"acupressure|sujok|massage ring", "Acupressure Finger Massage Ring", "90191090", 25, False, 150),
+    (r"lip balm", "Lip Balm", "33041000", 35, False, 150),
+    (r"lipstick|lip gloss|lip liner", "Lipstick", "33041000", 40, False, 150),
+    (r"mascara", "Mascara", "33042000", 60, False, 250),
+    (r"kajal|kohl|eye ?liner|insta liner", "Kajal / Eye Liner", "33042000", 35, False, 150),
+    (r"root concealer|retouch|root touch", "Root Touch-Up Spray", "33059090", 150, False, 300),
+    (r"foundation", "Foundation", "33049990", 80, True, 300),
+    (r"concealer", "Concealer", "33049990", 40, False, 250),
+    (r"primer", "Face Primer", "33049990", 40, False, 250),
+    (r"\bbb\+? cream|bb cream", "BB Cream", "33049990", 60, True, 250),
+    (r"sunscreen|uv defender|sun protect|nivea sun|sun lotion|sun cream", "Sunscreen", "33049990", 90, True, 350),
+    (r"face wash|facial wash|cleanser", "Face Wash", "33049990", 120, True, 200),
+    (r"hair removal|wax strip|depilat|\bveet\b", "Hair Removal", "33079090", 120, True, 250),
+    (r"shaving cream|shave cream|shave gel|shaving gel|after ?shave|lather", "Shaving Cream / Gel", "33071010", 110, True, 200),
+    (r"deodorant|body spray|\bdeo\b", "Deodorant Spray", "33072000", 190, True, 291),
+    (r"hair colou?r|hair dye|colou?r naturals|highlight kit|mehndi powder|henna powder|godrej nupur", "Hair Colour / Henna", "33059090", 130, True, 300),
+    (r"henna|mehndi|mehendi", "Henna Mehndi Cone", "33049990", 55, False, 150),
+    (r"shampoo", "Shampoo", "33051090", 200, True, 300),
+    (r"conditioner", "Conditioner", "33059090", 150, True, 300),
+    (r"hair mask", "Hair Mask", "33059090", 150, True, 300),
+    (r"hair serum|serum", "Serum", "33059090", 120, True, 300),
+    (r"hair oil|cool oil|bringha", "Hair Oil", "33059090", 150, True, 250),
+    (r"soap|bathing bar|bath bar", "Bath Soap", "34011190", 135, True, 100),
+    (r"talc|body powder|baby powder", "Body Powder", "33049990", 300, True, 250),
+    (r"parfum|perfume|eau de|\bedt\b|\bedp\b|cologne", "EDP", "33030040", 400, False, 350),
+    (r"body lotion|lotion", "Body Lotion", "33049990", 250, True, 280),
+    (r"moisturi[sz]er|cream|gel", "Cream / Gel", "33049990", 110, True, 250),
+]
+
+
+def category_specs(t, pack, size):
+    for pat, label, hs, dflt, from_size, val in CATEGORIES:
+        if re.search(pat, t):
+            if label == "EDP" and size:
+                unit_wt = 150 + 2.5 * size
+            elif from_size and size:
+                unit_wt = size * 1.1 + 30
+            else:
+                unit_wt = dflt
+            if label == "Black Tea" and size:
+                val = size * 0.5
+            return S(label, "", hs, round(max(unit_wt, 25)) * pack, round(val) * pack, "category")
+    return S("Personal Care Item", "", "33049990", 140 * pack, 250 * pack, "unknown")
+
+
+# ======================================================================
+# 5. Readable product names
+# ======================================================================
+BRANDS = [
+    (r"bella ?vita", "Bellavita"), (r"l['’`]?or[eé]al", "L'Oreal"), (r"maybelline( new york)?", "Maybelline"),
+    (r"lakm[eé]", "Lakme"), (r"pond['’`]?s", "Ponds"), (r"nivea", "Nivea"), (r"garnier", "Garnier"),
+    (r"old spice", "Old Spice"), (r"gillette", "Gillette"), (r"colgate", "Colgate"), (r"oral[- ]?b", "Oral-B"),
+    (r"tata sampann", "Tata Sampann"), (r"tata tea", "Tata Tea"), (r"cherry blossom", "Cherry Blossom"),
+    (r"kiwi", "Kiwi"), (r"moov", "Moov"), (r"betadine", "Betadine"), (r"supradyn", "Supradyn"),
+    (r"vaseline", "Vaseline"), (r"veet", "Veet"), (r"renee", "Renee"), (r"blue heaven", "Blue Heaven"),
+    (r"himalaya( herbals)?", "Himalaya"), (r"lotus", "Lotus"), (r"godrej", "Godrej"), (r"olay", "Olay"),
+    (r"fixderma", "Fixderma"), (r"sayy", "Sayy"), (r"olivia", "Olivia"), (r"hamam", "Hamam"),
+    (r"chandrika", "Chandrika"), (r"pears", "Pears"), (r"lux", "Lux"), (r"fem", "Fem"), (r"streax", "Streax"),
+    (r"indulekha", "Indulekha"), (r"navratna", "Navratna"), (r"kaveri", "Kaveri"), (r"wild stone", "Wild Stone"),
+    (r"johnson['’`]?s", "Johnson's"), (r"denver", "Denver"), (r"glade", "Glade"), (r"wishcare", "WishCare"),
+    (r"the derma co", "The Derma Co"), (r"insight", "Insight"), (r"mars", "MARS"), (r"deewal", "Deewal"),
+    (r"the body shop", "The Body Shop"), (r"the ordinary", "The Ordinary"), (r"urban gabru", "Urban Gabru"),
+    (r"nirmalaya", "Nirmalaya"), (r"chemist at play", "Chemist At Play"), (r"rexona", "Rexona"),
+    (r"dabur", "Dabur"), (r"elvive", "L'Oreal"), (r"biolage", "Biolage"),
+]
+KEEP_UPPER = {"BPA", "UV", "BB", "BB+", "EDP", "EDT", "CEO", "G.O.A.T", "GOAT", "AHA", "DIY", "SPF", "PA", "XL", "II", "III"}
+FLUFF = {
+    "luxury", "collection", "premium", "authentic", "genuine", "best", "new", "free", "shipping", "choose",
+    "pack", "of", "each", "and", "the", "with", "for", "in", "a", "by", "from", "&", "+", "-", "–",
+    "long", "lasting", "men", "women", "mens", "womens", "men's", "women's",
+}
+CUT_AT = re.compile(
+    r"\s[|–—]\s|\s-\s|\bexp\b|\bchoose\b|\bmultiple\b|\blong[- ]lasting\b|\bfree shipping\b|"
+    r"\bsmudge ?proof\b|\bwith\b|\bfor (?:men|women|all|oily|dry|hair|skin|sensitive)\b|"
+    r"\bmade in\b|\b24 ?h\b|\bmatte finish\b|\bpack\b|\bset of\b",
+    re.I,
 )
 
-st.title("📦 India Post Bulk Label Generator")
-st.caption(
-    "Automated bulk booking file creator with strict SubPiece value matching, "
-    "Ship-To address resolution, and pink/yellow highlighted parcels."
-)
+
+def titlecase(word):
+    if "-" in word and not any(c.isdigit() for c in word):
+        return "-".join(titlecase(p) for p in word.split("-") if p)
+    if re.fullmatch(r"(?:PA|SPF|UV)[\d+]*", word.upper()) and any(c in word for c in "+0123456789"):
+        return word.upper()
+    if any(c.isdigit() for c in word) or word.upper() in KEEP_UPPER:
+        return word.upper() if word.upper() in KEEP_UPPER else word
+    if "'" in word or "’" in word:
+        return word[:1].upper() + word[1:].lower()
+    return word.capitalize()
 
 
-# Helper function to prevent literal 'nan' strings in Excel cells
-def clean_str(val, fallback=""):
-  if pd.isna(val) or str(val).strip().lower() == "nan":
+def friendly_name(title, label, pack, size_txt, max_len, cut_after_size=True):
+    """Brand + product words + product type + size + pack, e.g.
+    'Maybelline Colossal Kajal Black 0.35g' / 'Pears Original Glycerin Soap 125g (6-Pack)'"""
+    t = clean_str(title)
+    brand = ""
+    for pat, canon in BRANDS:
+        m = re.search(r"(?<![a-z])" + pat + r"(?![a-z])", t, re.I)
+        if m:
+            brand = canon
+            t = t[:m.start()] + " " + t[m.end():]
+            break
+    t = re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", t)  # (100 ml) (Pack of 2) ... re-added below
+    t = re.sub(r"\bSPF\s*(\d+)\+*", r"SPF\1", t, flags=re.I)
+    t = re.sub(r"\b\d+\s*x\s*pack\s*of\s*\d+\b|\b\d+\s*packs?\s*of\s*\d+\b", " ", t, flags=re.I)
+    t = re.sub(r"\b(?:pack|set|box|bundle|combo|lot)\s*of\s*\d+\b", " ", t, flags=re.I)
+    t = re.sub(r"\b\d+\s*[- ]?\s*(?:pack|pcs|pk)\b|\bx\s*\d+\b|\b\d+\s*x\s*(?=\d)|\b\d+\s*x\b|\btwin pack\b", " ", t, flags=re.I)
+    # everything after the first size is usually marketing copy
+    m = SIZE_RE.search(t)
+    if cut_after_size and m and len(t[:m.start()].split()) >= 2:
+        t = t[:m.start()]
+    t = SIZE_RE.sub(" ", t)
+    t = re.sub(r"\beau de (?:parfum|perfume)\b", "EDP", t, flags=re.I)
+    t = re.sub(r"(?<![\w%])100%", " ", t)
+    m = CUT_AT.search(t)
+    if m and m.start() > 6:
+        t = t[:m.start()]
+    m = re.match(r"^\s*(\d{1,2})\s+(?=[A-Za-z])", t)  # leading '3 Glade ...' count
+    if m and int(m.group(1)) == pack:
+        t = t[m.end():]
+    raw = [w.strip(".,;:-") for w in re.split(r"[\s,/]+", t)]
+    words, seen = [], set()
+    for w in raw:
+        lw = w.lower()
+        if not w or re.fullmatch(r"[-–—|+&.:]+", w) or lw in FLUFF or (len(lw) >= 5 and lw in seen):
+            continue
+        seen.add(lw)
+        words.append(titlecase(w))
+
+    suffix = (" " + size_txt if size_txt else "") + (f" ({pack}-Pack)" if pack > 1 else "")
+    head = brand + " " if brand else ""
+    budget = max_len - len(suffix) - len(head)
+
+    lab_words = [w[:4] for w in re.split(r"[\s/()-]+", label.lower()) if len(w) > 2 and w not in ("care", "item", "and")]
+    if label == "EDP":
+        lab_words = ["edp", "parfum", "perfume"]
+    has_label = lambda ws: any(lw in " ".join(ws).lower() for lw in lab_words)
+
+    def fit(ws, room):
+        ws = list(ws)
+        while len(" ".join(ws)) > room and len(ws) > 1:
+            # drop the last word that is NOT the product-type word
+            idx = next((i for i in range(len(ws) - 1, -1, -1) if not has_label([ws[i]])), len(ws) - 1)
+            ws.pop(idx)
+        return ws
+
+    core = fit(words, budget)
+    if label and not has_label(words[:len(core)]):
+        core = fit(words, budget - len(label) - 1)
+        if not has_label(core):
+            core.append(label.split(" / ")[0])
+    out = (head + " ".join(core)).strip() + suffix
+    return re.sub(r"\s+", " ", out)[:max_len].strip() or clean_str(title)[:max_len]
+
+
+# ======================================================================
+# 6. Overrides (optional, permanent corrections)
+# ======================================================================
+def load_overrides(file_or_path):
+    try:
+        df = pd.read_excel(file_or_path, dtype=str).fillna("")
+    except Exception:
+        return {}
+    df.columns = [norm(c) for c in df.columns]
+    out = {}
+    for _, r in df.iterrows():
+        iid = re.sub(r"\.0$", "", r.get("itemid", "").strip())
+        if not iid:
+            continue
+        out[(iid, r.get("pack", "").strip())] = {
+            "name": r.get("name", "").strip(),
+            "hs": r.get("hscode", "").strip(),
+            "wt": money(r.get("weightg", "")),
+            "val": money(r.get("valueinr", "")),
+        }
+    return out
+
+
+def resolve_item(title, variation, item_id, cfg, overrides):
+    is_bv = bool(re.search(r"bella ?vita", clean_str(title), re.I))
+    v = variation_pack(variation)
+    if v:
+        pack, pack_src = max(1, min(v, 60)), "variation"
+    else:
+        pack, pack_src = title_pack(title, allow_x=not is_bv), "title"
+    size, size_txt = parse_size(title)
+    mset = re.search(r"(\d)\s*x\s*(\d+)\s*ml", clean_str(title), re.I) if is_bv else None
+    if mset:
+        size_txt = f"{mset.group(1)}x{mset.group(2)}ml"
+    spec = tuned_rules(clean_str(title).lower(), pack)
+    if spec is None:
+        spec = category_specs(clean_str(title).lower(), pack, size)
+    name = friendly_name(title, spec["label"], 1 if mset else pack, size_txt, cfg["max_name"],
+                         cut_after_size=not is_bv)
+    source = {"rule": "Your tuned rule", "category": "Estimated (category)", "unknown": "UNKNOWN item"}[spec["conf"]]
+    hs, wt, val = spec["hs"], spec["wt"], spec["val"]
+    ov = overrides.get((item_id, str(pack))) or overrides.get((item_id, ""))
+    if ov:
+        scale = 1 if (item_id, str(pack)) in overrides else pack
+        hs = ov["hs"] or hs
+        wt = ov["wt"] * scale if ov["wt"] else wt
+        val = ov["val"] * scale if ov["val"] else val
+        name = ov["name"] or name
+        source = "Override file"
+    return {
+        "name": name, "hs": hs, "wt": int(round(wt)), "val": int(round(val)),
+        "pack": pack, "pack_src": pack_src, "source": source,
+        "estimated": source in ("Estimated (category)", "UNKNOWN item"),
+    }
+
+
+# ======================================================================
+# 7. Order -> parcel
+# ======================================================================
+def currency_from_symbol(s, fallback):
+    s = clean_str(s)
+    if "£" in s:
+        return "GBP"
+    if "€" in s:
+        return "EUR"
+    if "$" in s:
+        return {"CAD": "CAD", "AUD": "AUD"}.get(fallback, "USD")
     return fallback
-  return str(val).strip()
 
 
-# ========================================================
-# 1. PRODUCT SPECIFICATION & WEIGHT MAPPING ENGINE
-# ========================================================
-def get_item_specs(title):
-  t = str(title).lower()
+def process(df, cols, cfg, overrides):
+    today = pd.Timestamp.now().strftime("%Y-%m-%d")
+    col = lambda n: cols.get(norm(n))
+    c_item, c_title, c_qty = col("Item number"), col("Item title"), col("Quantity")
+    c_sold, c_var = col("Sold for"), col("Variation details")
+    c_disp = col("Dispatched on date")
 
-  # Detect pack multiplier from title (e.g. "Pack of 2", "(2)", "2x", etc.)
-  pack_mult = 1
-  m_pack = re.search(r"pack\s*(?:of)?\s*(\d+)", t)
-  m_lead = re.match(r"^(\d+)\s+", t)
-  m_paren = re.search(r"[\(\[]\s*(\d+)\s*[\)\]]", t)
-  m_x = re.search(r"(\d+)\s*x\s*(?!20ml|100ml)", t)
+    parcels, lines_out, sub_rows = [], [], []
+    marks = {}  # (serial, ArticleDetails column) -> fill
+    sub_marks = []  # (subpiece row index, fill)
+    addr_index = {}
 
-  if m_pack:
-    pack_mult = int(m_pack.group(1))
-  elif m_lead and int(m_lead.group(1)) in [2, 3, 4, 5, 6, 8]:
-    pack_mult = int(m_lead.group(1))
-  elif m_paren and int(m_paren.group(1)) in [2, 3, 4, 5, 6, 8]:
-    pack_mult = int(m_paren.group(1))
-  elif m_x and int(m_x.group(1)) in [2, 3, 4, 5, 6, 8]:
-    pack_mult = int(m_x.group(1))
+    colmap = {norm(c): c for c in df.columns}
+    serial = 0
+    for order_id, grp in df.groupby("_order", sort=False):
+        serial += 1
+        addr, source, ship, buyer = resolve_address(grp, colmap)
+        flags = []  # (level, text)
 
-  # --- Olivia Herbal Bleach Cream ---
-  if "olivia" in t and "bleach" in t:
-    return {
-        "desc": "Olivia Herbal Bleach Cream",
-        "hs": "33049910",
-        "wt": 49 * pack_mult,
-        "val": 55 * pack_mult,
-        "is_multi": pack_mult > 1,
-    }
+        # --- destination
+        craw = addr["country"] or buyer["country"]
+        info = COUNTRIES.get(craw.lower())
+        if info:
+            code, cname, cur_default = info
+        else:
+            code, cname, cur_default = "", craw or "?", "GBP"
+            flags.append(("error", f"Country '{craw}' not recognised - set code/rate manually"))
+        zipcode = norm_postcode(addr["zip"], code)
 
-  # --- Betadine Antiseptic ---
-  if "betadine" in t:
-    return {
-        "desc": "Betadine Povidone-iodine",
-        "hs": "30049099",
-        "wt": 248 if pack_mult == 2 else 140 * pack_mult,
-        "val": 90 * pack_mult,
-        "is_multi": pack_mult > 1,
-    }
+        if source == "buyer":
+            flags.append(("error", "Ship-To address missing in CSV - BUYER address used, please check"))
+            for f in ("RECEIVER NAME", "RECEIVER ADD LINE 1", "RECEIVER ZIPCODE"):
+                marks[(serial, f)] = RED
+        for key, colname, label in [("name", "RECEIVER NAME", "name"), ("add1", "RECEIVER ADD LINE 1", "address line 1"),
+                                    ("city", "RECEIVER CITY", "city"), ("zip", "RECEIVER ZIPCODE", "postcode")]:
+            if not (zipcode if key == "zip" else addr[key]):
+                flags.append(("error", f"Receiver {label} is blank"))
+                marks[(serial, colname)] = RED
+        if code == "GB" and zipcode and not re.fullmatch(r"[A-Z]{1,2}\d[A-Z\d]? \d[A-Z]{2}", zipcode):
+            flags.append(("warn", f"UK postcode '{zipcode}' looks wrong"))
+            marks[(serial, "RECEIVER ZIPCODE")] = RED
+        if code == "US" and zipcode and not re.fullmatch(r"\d{5}", zipcode):
+            flags.append(("warn", f"US ZIP '{zipcode}' looks wrong"))
+            marks[(serial, "RECEIVER ZIPCODE")] = RED
 
-  # --- Fragrances & Perfumes (Bellavita, Wild Stone, Fogg) ---
-  if any(k in t for k in ["bella vita", "bellavita", "perfume", "oud", "edp"]):
-    hs = "33030040"
-    if "intense" in t and ("ceo" in t or "100" in t):
-      return {
-          "desc": "Bellavita CEO Intense 100ml",
-          "hs": hs,
-          "wt": 448 * pack_mult,
-          "val": 450 * pack_mult,
-          "is_multi": pack_mult > 1,
-      }
-    if any(
-        k in t
-        for k in ["combo", "2 pack", "2 x 100ml", "ceo + goat", "ceo and goat"]
-    ):
-      return {
-          "desc": "Bellavita CEO & GOAT 2Pk",
-          "hs": hs,
-          "wt": 848,
-          "val": 700,
-          "is_multi": True,
-      }
-    if any(k in t for k in ["gift set", "4 x 20ml", "4x20ml", "all star"]):
-      if (
-          pack_mult == 2
-          or "pack of 2" in t
-          or "2 bella vita" in t
-          or "set 2" in t
-      ):
-        return {
-            "desc": "Bellavita Gift Set 4x20ml 2Pk",
-            "hs": hs,
-            "wt": 848,
-            "val": 700,
-            "is_multi": True,
-        }
-      return {
-          "desc": "Bellavita Gift Set 4x20ml",
-          "hs": hs,
-          "wt": 398,
-          "val": 350,
-          "is_multi": False,
-      }
-    if any(
-        k in t
-        for k in [
-            "2 x 20ml",
-            "2x20ml",
-            "white and honey",
-            "white oud & honey",
-            "fresh + white",
-            "date and senorita",
-            "ceo + white",
-            "date & glam",
-        ]
-    ):
-      return {
-          "desc": "Bellavita Perfume Duo 2x20ml",
-          "hs": hs,
-          "wt": 198,
-          "val": 360,
-          "is_multi": True,
-      }
-    if "20ml" in t:
-      return {
-          "desc": "Bellavita Pocket Perfume 20ml",
-          "hs": hs,
-          "wt": 98 * pack_mult,
-          "val": 180 * pack_mult,
-          "is_multi": pack_mult > 1,
-      }
-    if any(k in t for k in ["dark oud", "oud dark", "oud gold"]):
-      return {
-          "desc": "Bellavita Dark Oud EDP 100ml",
-          "hs": hs,
-          "wt": 498 * pack_mult,
-          "val": 486 * pack_mult,
-          "is_multi": pack_mult > 1,
-      }
-    return {
-        "desc": "Bellavita Eau De Parfum 100ml",
-        "hs": hs,
-        "wt": 398 * pack_mult,
-        "val": 350 * pack_mult,
-        "is_multi": pack_mult > 1,
-    }
+        state = addr["state"]
+        if not state:
+            found = lookup_county(zipcode, code) if cfg.get("lookup") else ""
+            if found:
+                state = found
+                marks[(serial, "RECEIVER STATE")] = SKY
+                flags.append(("info", f"County blank - '{found}' looked up online from postcode {zipcode} (sky blue) - please verify"))
+            else:
+                state = addr["city"]
+                marks[(serial, "RECEIVER STATE")] = YELLOW
+                flags.append(("info", "County blank and lookup unavailable - City used (yellow)"))
 
-  # --- Skincare, Serums & Face Packs ---
-  if any(k in t for k in ["detan", "moroccon", "face pack", "sayy"]):
-    return {
-        "desc": "Sayy Moroccan DeTan Mask",
-        "hs": "33049090",
-        "wt": 140 * pack_mult,
-        "val": 210 * pack_mult,
-        "is_multi": pack_mult > 1,
-    }
-  if any(k in t for k in ["elvive", "serum", "loreal paris", "biolage"]):
-    if "combo" in t:
-      return {
-          "desc": "Loreal Elvive Hair Combo",
-          "hs": "33059090",
-          "wt": 548,
-          "val": 506,
-          "is_multi": True,
-      }
-    if pack_mult > 1:
-      wt_map = {2: 240, 3: 348, 4: 490}
-      return {
-          "desc": "Loreal Paris Elvive Serum",
-          "hs": "33059090",
-          "wt": wt_map.get(pack_mult, 140 * pack_mult),
-          "val": 434 * pack_mult,
-          "is_multi": True,
-      }
-    return {
-        "desc": "Loreal Paris Elvive Serum",
-        "hs": "33059090",
-        "wt": 140,
-        "val": 434,
-        "is_multi": False,
-    }
-  if any(k in t for k in ["gluta hya", "gluta-hya", "vaseline"]):
-    if any(k in t for k in ["bundle", "pack of 3", "(3)"]) or pack_mult == 3:
-      return {
-          "desc": "Vaseline Gluta Hya 3Pk",
-          "hs": "33049090",
-          "wt": 645,
-          "val": 826,
-          "is_multi": True,
-      }
-    if "400ml" in t or "sun protect" in t:
-      return {
-          "desc": "Vaseline Body Lotion 400ml",
-          "hs": "33049090",
-          "wt": 480 * pack_mult,
-          "val": 340 * pack_mult,
-          "is_multi": pack_mult > 1,
-      }
-    if pack_mult > 1:
-      return {
-          "desc": "Vaseline Gluta Hya Lotion",
-          "hs": "33049090",
-          "wt": 398 if pack_mult == 2 else 249 * pack_mult,
-          "val": 255 * pack_mult,
-          "is_multi": True,
-      }
-    return {
-        "desc": "Vaseline Gluta Hya Lotion",
-        "hs": "33049090",
-        "wt": 249,
-        "val": 255,
-        "is_multi": False,
-    }
-  if any(k in t for k in ["roll on", "roll-on", "chemist at play", "rexona"]):
-    return {
-        "desc": "Deodorant Underarm Roll On",
-        "hs": "33072000",
-        "wt": 98 * pack_mult,
-        "val": 291 * pack_mult,
-        "is_multi": pack_mult > 1,
-    }
-  if "supradyn" in t:
-    return {
-        "desc": "Supradyn Multivitamin 60s",
-        "hs": "21069099",
-        "wt": 98 * pack_mult,
-        "val": 250 * pack_mult,
-        "is_multi": pack_mult > 1,
-    }
+        phone = re.sub(r"\D", "", addr["phone"])
+        if len(phone) < 8:
+            flags.append(("warn", "Receiver phone missing - placeholder 0000000000 used"))
+            phone = "0000000000"
+            marks[(serial, "RECEIVER MOBILE NO")] = RED
 
-  # --- Shoe Polish & Sponges ---
-  if "sponge" in t:
-    return {
-        "desc": "Kiwi Shoe Shine Sponge",
-        "hs": "34051000",
-        "wt": 198 if pack_mult == 2 else 98 * pack_mult,
-        "val": 170 * pack_mult,
-        "is_multi": pack_mult > 1,
-    }
-  if any(k in t for k in ["kiwi", "cherry blossom", "shoe polish"]):
-    if any(k in t for k in ["instant", "liquid"]):
-      return {
-          "desc": "Kiwi Instant Shoe Polish",
-          "hs": "34051000",
-          "wt": 198 if pack_mult == 2 else 98 * pack_mult,
-          "val": 106 * pack_mult,
-          "is_multi": pack_mult > 1,
-      }
-    return {
-        "desc": "Kiwi Shoe Polish Wax Tin",
-        "hs": "34051000",
-        "wt": 248 if pack_mult == 2 else 120 * pack_mult,
-        "val": 106 * pack_mult,
-        "is_multi": pack_mult > 1,
-    }
+        if source == "ship" and buyer["add1"] and (
+            norm(buyer["add1"]) != norm(addr["add1"]) or norm(buyer["zip"]) != norm(addr["zip"])
+        ):
+            flags.append(("info", "Ship-To differs from buyer's own address (correct - Ship-To used)"))
 
-  # --- Copperware ---
-  if "copper" in t:
-    if any(k in t for k in ["pot", "jug"]):
-      return {
-          "desc": "Pure Copper Water Pot",
-          "hs": "74198090",
-          "wt": 326,
-          "val": 945,
-          "is_multi": False,
-      }
-    wt_balls = 49 if pack_mult <= 2 else (98 if pack_mult <= 4 else 198)
-    return {
-        "desc": "Ayurvedic Copper Ball",
-        "hs": "74198090",
-        "wt": wt_balls,
-        "val": 162 * (pack_mult // 2 if pack_mult > 1 else 1),
-        "is_multi": pack_mult > 1,
-    }
+        if c_disp and any(clean_str(v) for v in grp[c_disp]):
+            flags.append(("info", "Already marked dispatched on eBay"))
 
-  # --- Shaving Razors & Blades ---
-  if any(k in t for k in ["guard", "mach 3", "fusion", "vector", "razor"]):
-    return {
-        "desc": "Gillette Shaving Razor",
-        "hs": "82121010",
-        "wt": 198 if pack_mult == 2 else 98 * pack_mult,
-        "val": 260 * pack_mult,
-        "is_multi": pack_mult > 1,
-    }
+        # --- lines
+        rate_cur = cur_default
+        parcel_wt = parcel_val = 0
+        multi = len(grp) > 1
+        order_lines = []
+        for lsn, (_, row) in enumerate(grp.iterrows(), start=1):
+            title = clean_str(row[c_title])
+            if not title:
+                continue
+            item_id = re.sub(r"\.0$", "", clean_str(row[c_item]))
+            try:
+                qty = max(1, int(float(clean_str(row[c_qty]) or 1)))
+            except ValueError:
+                qty = 1
+            variation = clean_str(row[c_var]) if c_var else ""
+            it = resolve_item(title, variation, item_id, cfg, overrides)
+            cur = currency_from_symbol(row[c_sold] if c_sold else "", cur_default)
+            rate_cur = cur
+            rate = cfg["rates"].get(cur, DEFAULT_RATES.get(cur, 100.0))
+            unit_fob = money(row[c_sold]) if c_sold else 0.0
+            if not unit_fob:
+                unit_fob = round(it["val"] / qty / rate, 2)
+            tot_wt, tot_val = it["wt"] * qty, it["val"] * qty
+            parcel_wt += tot_wt
+            parcel_val += tot_val
+            if qty > 1 or it["pack"] > 1:
+                multi = True
+            sub_rows.append({
+                "SERIAL NUMBER REF ": serial, "HS CODE": it["hs"], "CTH CODE": it["hs"],
+                "HS DESCRIPTION": it["name"], "SP UNIT CD": "PC", "SP COUNT": qty,
+                "SP WEIGHT TOTAL": tot_wt, "SP NET WEIGHT": tot_wt,
+                "SP ORIGIN COUNTRY CODE": "IN", "SP ORIGIN CURRENCY CODE": "INR",
+                "SP COMM INVOICE NO": order_id, "SP COM INVOICE DATE(DD-MM-YYYY)": today,
+                "SP INVOICE LSN": lsn, "SP INV CURRENCY CODE": cur,
+                "SP INV EXCHANGE RATE": int(rate), "SP ASBL FOB VALUE": round(unit_fob * qty, 2),
+                "SP ASBL INR VAL": tot_val, "SP TAX INVOICE NO": order_id, "SP TAX INVOICE DATE": today,
+                "SP INV VALUE PU": it["val"], "SP INV VALUE TOTAL": tot_val,
+                "ecommerce_url": "Ebay.com", "ecommerce_sku": item_id,
+            })
+            if it["estimated"]:
+                sub_marks.append((len(sub_rows) - 1, ORANGE))
+            order_lines.append({
+                "Serial": serial, "Order": order_id, "Item number": item_id, "eBay title": title,
+                "Variation": variation, "Qty": qty, "Pack": it["pack"], "Pack from": it["pack_src"],
+                "India Post name": it["name"], "HS": it["hs"], "Unit wt (g)": it["wt"], "Line wt (g)": tot_wt,
+                "Line INR": tot_val, "Source": it["source"],
+            })
+            if it["source"] == "UNKNOWN item":
+                flags.append(("warn", f"Item {item_id}: product type not recognised - check HS/weight"))
+            elif it["estimated"]:
+                flags.append(("info", f"Item {item_id}: weight/HS estimated from category (orange)"))
+        lines_out += order_lines
+        if not order_lines:
+            serial -= 1
+            continue
+        if multi:
+            marks[(serial, "PHYSICAL WEIGHT")] = PINK
+            flags.append(("info", "Multi-buy / multi-pack parcel (pink weight)"))
 
-  # --- Oral Care ---
-  if any(k in t for k in ["toothbrush", "oral b", "oral-b"]):
-    return {
-        "desc": "Oral Care Toothbrush Pack",
-        "hs": "96032100",
-        "wt": 198 if pack_mult == 2 else 98 * pack_mult,
-        "val": 213 * pack_mult,
-        "is_multi": pack_mult > 1,
-    }
-  if any(k in t for k in ["paste", "dabur", "colgate"]):
-    return {
-        "desc": "Dental Toothpaste Tube",
-        "hs": "33061020",
-        "wt": 198 * pack_mult,
-        "val": 210 * pack_mult,
-        "is_multi": pack_mult > 1,
-    }
+        key = (norm(addr["name"]), norm(addr["add1"]), norm(zipcode))
+        addr_index.setdefault(key, []).append((serial, order_id))
 
-  # Default fallback
-  return {
-      "desc": str(title)[:28],
-      "hs": "33049990",
-      "wt": 140 * pack_mult,
-      "val": 250 * pack_mult,
-      "is_multi": pack_mult > 1,
-  }
-
-
-# ========================================================
-# 2. FILE UPLOADER & PROCESSING PIPELINE
-# ========================================================
-uploaded_file = st.file_uploader("Upload eBay Orders CSV Report", type=["csv"])
-
-if uploaded_file is not None:
-  try:
-    content = uploaded_file.getvalue().decode("utf-8-sig", errors="ignore")
-    lines = content.splitlines()
-
-    header_idx = -1
-    for i, line in enumerate(lines[:10]):
-      if "Order Number" in line or "Order number" in line:
-        header_idx = i
-        break
-
-    if header_idx == -1:
-      st.error("Could not find 'Order Number' header in the CSV.")
-      st.stop()
-
-    df_raw = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
-    df_raw.columns = [str(c).strip() for c in df_raw.columns]
-
-    order_col = (
-        "Order Number" if "Order Number" in df_raw.columns else "Order number"
-    )
-    valid_orders = df_raw[
-        df_raw[order_col]
-        .astype(str)
-        .str.contains(r"^\d{2}-\d{5}-\d{5}$", regex=True)
-    ].copy()
-
-    if valid_orders.empty:
-      st.warning("No valid eBay orders found in the uploaded file.")
-      st.stop()
-
-    st.success(
-        f"Found {len(valid_orders[order_col].unique())} unique orders to"
-        " process!"
-    )
-
-    article_rows = []
-    subpiece_rows = []
-    highlight_articles = []
-    yellow_state_articles = []
-    order_serial = 1
-
-    for order_id, order_group in valid_orders.groupby(order_col, sort=False):
-      title_col = (
-          "Item Title" if "Item Title" in order_group.columns else "Item title"
-      )
-      item_rows = order_group[
-          order_group[title_col].fillna("").str.strip() != ""
-      ]
-      if item_rows.empty:
-        item_rows = order_group.head(1)
-
-      first_row = order_group.iloc[0]
-
-      # Clean and normalize all keys in row (removes spaces, hyphens, slashes)
-      clean_row = {}
-      for k, v in first_row.items():
-        k_norm = re.sub(r"[^a-z0-9]", "", str(k).lower())
-        s = clean_str(v)
-        if s and s.lower() != "nan":
-          clean_row[k_norm] = s
-
-      # Helper that STRICTLY looks for Ship-To fields first
-      def get_field_strict(target_field):
-        ship_prefixes = [
-            "shipto",
-            "shipping",
-            "recipient",
-            "delivery",
-            "receiver",
-            "ship",
-        ]
-        buyer_prefixes = ["buyer", "customer", "user"]
-
-        suffixes_map = {
-            "name": ["name", "fullname", "contactname"],
-            "add1": ["address1", "street1", "addressline1", "add1"],
-            "add2": ["address2", "street2", "addressline2", "add2"],
-            "city": ["city", "town"],
-            "state": ["stateprovince", "state", "province", "county", "region"],
-            "zip": ["zip", "postcode", "postalcode", "zipcode"],
-            "country": ["country", "countrycode", "destinationcountry"],
-        }
-        suffixes = suffixes_map.get(target_field, [])
-
-        # Priority 1: Check Ship-To fields
-        for p in ship_prefixes:
-          for s in suffixes:
-            match_key = re.sub(r"[^a-z0-9]", "", p + s)
-            for k, val in clean_row.items():
-              if k == match_key and val:
-                return val
-
-        # Priority 2: Check Buyer fields (Fallback only)
-        for p in buyer_prefixes:
-          for s in suffixes:
-            match_key = re.sub(r"[^a-z0-9]", "", p + s)
-            for k, val in clean_row.items():
-              if k == match_key and val:
-                return val
-
-        # Priority 3: Direct key (e.g. just 'city' or 'postcode')
-        for s in suffixes:
-          match_key = re.sub(r"[^a-z0-9]", "", s)
-          for k, val in clean_row.items():
-            if k == match_key and val:
-              return val
-
-        return ""
-
-      # 1. Country & Exchange Rate
-      country_raw = get_field_strict("country")
-      if any(
-          c in country_raw.lower()
-          for c in ["us", "usa", "united states", "america"]
-      ):
-        dest_code = "US"
-        dest_name = "United States of America"
-        currency_code = "USD"
-        ex_rate = 96.0
-      else:
-        dest_code = "GB"
-        dest_name = "United Kingdom"
-        currency_code = "GBP"
-        ex_rate = 128.0
-
-      # 2. Receiver Address Fields (Guaranteed Ship-To Priority)
-      ship_name = get_field_strict("name")
-      add1 = get_field_strict("add1")
-      add2 = get_field_strict("add2")
-      city = get_field_strict("city")
-      state = get_field_strict("state")
-
-      # Fallback: Agar state blank hai (jaise UK orders mein), to City use karein aur Yellow mark karein
-      if not state:
-        state = city
-        yellow_state_articles.append(order_serial)
-
-      zipcode = get_field_strict("zip").upper()
-
-      # US ZIP code: strip extension after '-' (e.g. 90210-1234 -> 90210)
-      if dest_code == "US" and "-" in zipcode:
-        zipcode = zipcode.split("-")[0].strip()
-
-      # Phone Extractor: Strictly checks Ship-To phone first
-      raw_phone = ""
-      for k, v in clean_row.items():
-        if (
-            "ship" in k or "delivery" in k or "recipient" in k
-        ) and ("phone" in k or "mobile" in k or "contact" in k or "tel" in k):
-          raw_phone = v
-          break
-
-      if not raw_phone:
-        for k, v in clean_row.items():
-          if ("buyer" in k or "customer" in k) and (
-              "phone" in k or "mobile" in k or "contact" in k or "tel" in k
-          ):
-            raw_phone = v
-            break
-
-      if not raw_phone:
-        for k, v in clean_row.items():
-          if "phone" in k or "mobile" in k or "tel" in k:
-            raw_phone = v
-            break
-
-      clean_phone = re.sub(r"[^\d]", "", str(raw_phone))
-      if not clean_phone:
-        clean_phone = "0000000000"
-
-      parcel_total_weight = 0
-      parcel_total_declared_val = 0
-      order_is_multi = len(item_rows) > 1
-      current_order_subpieces = []
-
-      # Loop over EVERY distinct item line in this order
-      for lsn, (_, item) in enumerate(item_rows.iterrows(), start=1):
-        item_title = str(item.get(title_col, ""))
-        num_col = (
-            "Item Number" if "Item Number" in item.index else "Item number"
-        )
-        item_id = str(item.get(num_col, "")).strip()
-
-        qty_col = "Quantity" if "Quantity" in item.index else "Item Quantity"
-        try:
-          qty = int(float(item.get(qty_col, 1)))
-          if qty < 1:
-            qty = 1
-        except:
-          qty = 1
-
-        specs = get_item_specs(item_title)
-        if specs["is_multi"] or qty > 1:
-          order_is_multi = True
-
-        item_total_weight = specs["wt"] * qty
-        unit_declared_val = specs["val"]
-        item_total_declared_val = unit_declared_val * qty
-
-        sold_col = "Sold For" if "Sold For" in item.index else "Sold for"
-        try:
-          raw_p = (
-              str(item.get(sold_col, "0"))
-              .replace("£", "")
-              .replace("$", "")
-              .replace(",", "")
-              .strip()
-          )
-          unit_fob = float(raw_p)
-        except:
-          unit_fob = round(unit_declared_val / ex_rate, 2)
-        total_fob = round(unit_fob * qty, 2)
-
-        parcel_total_weight += item_total_weight
-        parcel_total_declared_val += item_total_declared_val
-
-        # SubPiece entry
-        current_order_subpieces.append({
-            "SERIAL NUMBER REF ": order_serial,
-            "HS CODE": specs["hs"],
-            "CTH CODE": specs["hs"],
-            "HS DESCRIPTION": specs["desc"],
-            "SP UNIT CD": "PC",
-            "SP COUNT": qty,
-            "SP WEIGHT TOTAL": item_total_weight,
-            "SP NET WEIGHT": item_total_weight,
-            "SP ORIGIN COUNTRY CODE": "IN",
-            "SP ORIGIN CURRENCY CODE": "INR",
-            "SP COMM INVOICE NO": order_id,
-            "SP COM INVOICE DATE(DD-MM-YYYY)": pd.Timestamp.now().strftime(
-                "%Y-%m-%d"
-            ),
-            "SP INVOICE LSN": lsn,
-            "SP INV CURRENCY CODE": currency_code,
-            "SP INV EXCHANGE RATE": int(ex_rate),
-            "SP ASBL FOB VALUE": total_fob,
-            "SP ASBL INR VAL": item_total_declared_val,
-            "SP TAX INVOICE NO": order_id,
-            "SP TAX INVOICE DATE": pd.Timestamp.now().strftime("%Y-%m-%d"),
-            "SP INV VALUE PU": unit_declared_val,
-            "SP INV VALUE TOTAL": item_total_declared_val,
-            "ecommerce_url": "Ebay.com",
-            "ecommerce_paytranid": np.nan,
-            "ecommerce_sku": item_id,
+        parcels.append({
+            "SERIAL NUMBER": serial, "DESTINATION COUNTRY NAME": cname, "DESTINATION COUNTRY CODE": code,
+            "MAIL NATURE TYPE": 11, "MAIL TRANSPORT TYPE": "AMS", "PHYSICAL WEIGHT": parcel_wt,
+            "DECLARED VALUE": parcel_val, "NON DELIVERY INSTRUCTIONS": "P",
+            **SENDER,
+            "RECEIVER NAME": addr["name"], "RECEIVER ADD LINE 1": addr["add1"],
+            "RECEIVER ADD LINE 2": addr["add2"], "RECEIVER CITY": addr["city"], "RECEIVER STATE": state,
+            "RECEIVER ZIPCODE": zipcode, "RECEIVER MOBILE NO": phone, "BULK REF": order_id,
+            "DROP OFF PINCODE": 136118, "PBE TYPE": "PBEIII", "PBE FILING": "SELF",
+            "_flags": flags, "_ship_source": source, "_buyer": buyer, "_currency": rate_cur,
+            "_multi": multi,
         })
 
-      if order_is_multi:
-        highlight_articles.append(order_serial)
+    # same address across different orders
+    for key, lst in addr_index.items():
+        if len(lst) > 1 and key[1]:
+            for s, o in lst:
+                others = ", ".join(x[1] for x in lst if x[0] != s)
+                parcels[s - 1]["_flags"].append(("warn", f"Same address as other order(s): {others} (could be combined?)"))
+    return parcels, sub_rows, sub_marks, marks, lines_out
 
-      # Article Details entry
-      article_rows.append({
-          "SERIAL NUMBER": order_serial,
-          "ARTICLE NUMBER": np.nan,
-          "DESTINATION COUNTRY NAME": dest_name,
-          "DESTINATION COUNTRY CODE": dest_code,
-          "MAIL NATURE TYPE": 11,
-          "MAIL TRANSPORT TYPE": "AMS",
-          "PHYSICAL WEIGHT": parcel_total_weight,
-          "DECLARED VALUE": parcel_total_declared_val,
-          "NON DELIVERY INSTRUCTIONS": "P",
-          "SENDER NAME": "NEELA SHARMA",
-          "SENDER COMPANY": "SHARMEX GLOBAL",
-          "SENDER ADD LINE 1": "1037, NEW MODEL TOWN",
-          "SENDER ADD LINE 2": "PINJORE",
-          "SENDER ADD LINE 3": np.nan,
-          "SENDER CITY": "PANCHKULA",
-          "SENDER STATE": "HR",
-          "SENDER COUNTRY NAME": "India",
-          "SENDER COUNTRY CODE": "IN",
-          "SENDER PINCODE": 134102,
-          "SENDER EMAILID": "sharmexglobal@gmail.com",
-          "SENDER MOBILE": "8629056095",
-          "RECEIVER NAME": ship_name,
-          "RECEIVER ADD LINE 1": add1,
-          "RECEIVER ADD LINE 2": add2 if add2 != "" else np.nan,
-          "RECEIVER CITY": city,
-          "RECEIVER STATE": state,
-          "RECEIVER ZIPCODE": zipcode,
-          "RECEIVER MOBILE NO": clean_phone,
-          "BULK REF": str(order_id),
-          "DROP OFF PINCODE": 136118,
-          "PBE TYPE": "PBEIII",
-          "PBE FILING": "SELF",
-          "INCOTERMS": "DAP",
-      })
 
-      subpiece_rows.extend(current_order_subpieces)
-      order_serial += 1
+# ======================================================================
+# 8. Excel output
+# ======================================================================
+def build_workbook(parcels, sub_rows, sub_marks, marks):
+    wb = openpyxl.load_workbook(TEMPLATE_PATH)
+    for name, rows in (("ArticleDetails", parcels), ("SubPieces", sub_rows)):
+        ws = wb[name]
+        header = {str(c.value): c.column for c in ws[1] if c.value}
+        if ws.max_row > 1:
+            ws.delete_rows(2, ws.max_row)
+        for r_i, row in enumerate(rows, start=2):
+            for h, ci in header.items():
+                v = row.get(h, None)
+                if v == "":
+                    v = None
+                ws.cell(r_i, ci, v)
+        if name == "ArticleDetails":
+            for (serial, colname), fill in marks.items():
+                if colname in header:
+                    ws.cell(serial + 1, header[colname]).fill = fill
+        else:
+            for idx, fill in sub_marks:
+                ws.cell(idx + 2, header["HS DESCRIPTION"]).fill = fill
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
-    df_art_final = pd.DataFrame(article_rows)
-    df_sub_final = pd.DataFrame(subpiece_rows)
 
-    output_buffer = io.BytesIO()
-    tpl_path = "template.xlsx"
+def build_report(parcels, lines_out):
+    rows = []
+    for p in parcels:
+        lv = {"error": 0, "warn": 1, "info": 2}
+        status = "CHECK" if any(l == "error" for l, _ in p["_flags"]) else (
+            "Review" if any(l == "warn" for l, _ in p["_flags"]) else "OK")
+        b = p["_buyer"]
+        rows.append({
+            "Serial": p["SERIAL NUMBER"], "Order": p["BULK REF"], "Status": status,
+            "Ship-To name": p["RECEIVER NAME"], "Address 1": p["RECEIVER ADD LINE 1"],
+            "Address 2": p["RECEIVER ADD LINE 2"], "City": p["RECEIVER CITY"], "State": p["RECEIVER STATE"],
+            "Postcode": p["RECEIVER ZIPCODE"], "Country": p["DESTINATION COUNTRY CODE"],
+            "Phone": p["RECEIVER MOBILE NO"], "Weight (g)": p["PHYSICAL WEIGHT"],
+            "Declared INR": p["DECLARED VALUE"], "Multi-buy": "YES" if p["_multi"] else "",
+            "Address source": "Ship-To" if p["_ship_source"] == "ship" else "BUYER (fallback!)",
+            "Buyer address (info)": ", ".join(x for x in [b["add1"], b["city"], b["zip"]] if x),
+            "Notes": " | ".join(t for l, t in sorted(p["_flags"], key=lambda x: lv[x[0]])),
+            "_order_key": lv[min((l for l, _ in p["_flags"]), key=lambda x: lv[x], default="info")]
+            if p["_flags"] else 3,
+        })
+    orders_df = pd.DataFrame(rows)
+    return orders_df, pd.DataFrame(lines_out)
+
+
+def overrides_template(lines_df):
+    d = lines_df[lines_df["Source"].isin(["Estimated (category)", "UNKNOWN item"])]
+    d = d.drop_duplicates(["Item number", "Pack"])
+    return pd.DataFrame({
+        "item_id": d["Item number"], "pack": d["Pack"], "title (info only)": d["eBay title"],
+        "name": d["India Post name"], "hs_code": d["HS"],
+        "weight_g": d["Line wt (g)"] / d["Qty"], "value_inr": d["Line INR"] / d["Qty"],
+    })
+
+
+# ======================================================================
+# 9. UI
+# ======================================================================
+LEGEND = [
+    ("#FFB6C1", "Pink", "Multi-buy / multi-pack: weight cell. Check the total weight."),
+    ("#87CEEB", "Sky blue", "County/state was blank, looked up online. Please verify."),
+    ("#FFFF00", "Yellow", "No county found, so the city was used."),
+    ("#FF6B6B", "Red", "Must fix before uploading (missing/invalid address, phone, or buyer address used)."),
+    ("#FFC000", "Orange", "Item name cell: weight/HS code is estimated. Please verify."),
+]
+
+
+def show_legend():
+    rows = "".join(
+        f'<div style="display:flex;align-items:center;gap:10px;margin:4px 0">'
+        f'<span style="background:{c};color:#000;border:1px solid #888;border-radius:4px;'
+        f'padding:2px 10px;min-width:78px;text-align:center;font-weight:600">{n}</span>'
+        f'<span>{d}</span></div>'
+        for c, n, d in LEGEND
+    )
+    with st.expander("🎨 Colour key (what the colours in the Excel mean)", expanded=True):
+        st.markdown(rows, unsafe_allow_html=True)
+
+
+def main():
+    st.set_page_config(page_title="India Post Label Generator - Sharmex Global", page_icon="📦", layout="wide")
+    st.title("📦 India Post Bulk Label Generator")
+    st.caption("Ship-To address always used · Multi-buy aware (reads Variation details) · Readable item names")
+
+    with st.sidebar:
+        st.header("Settings")
+        rates = {
+            "GBP": st.number_input("GBP → INR", value=DEFAULT_RATES["GBP"], step=1.0),
+            "USD": st.number_input("USD → INR", value=DEFAULT_RATES["USD"], step=1.0),
+        }
+        rates = {**DEFAULT_RATES, **rates}
+        max_name = st.slider("Max item-name length", 25, 100, 50,
+                             help="Length of HS DESCRIPTION. Lower it if India Post rejects long text.")
+        lookup = st.checkbox("Look up missing county online", value=True,
+                             help="Uses postcodes.io (UK) / zippopotam.us (US). Filled cells are sky blue - verify them.")
+        ov_file = st.file_uploader("overrides.xlsx (optional)", type=["xlsx"],
+                                   help="Your permanent corrections: item_id, pack, name, hs_code, weight_g, value_inr")
+
+    show_legend()
+
+    up = st.file_uploader("Upload eBay Orders CSV", type=["csv"])
+    if not up:
+        return
+    if not os.path.exists(TEMPLATE_PATH):
+        st.error("template.xlsx not found next to app.py")
+        return
+    overrides = {}
+    if ov_file is not None:
+        overrides = load_overrides(ov_file)
+    elif os.path.exists(OVERRIDES_PATH):
+        overrides = load_overrides(OVERRIDES_PATH)
+
     try:
-      wb_tpl = openpyxl.load_workbook(tpl_path, data_only=True)
-      ref_art_cols = [
-          cell.value for cell in wb_tpl["ArticleDetails"][1] if cell.value
-      ]
-      ref_sub_cols = [
-          cell.value for cell in wb_tpl["SubPieces"][1] if cell.value
-      ]
-    except:
-      ref_art_cols = list(df_art_final.columns)
-      ref_sub_cols = list(df_sub_final.columns)
+        df, cols = read_orders_csv(up.getvalue())
+        if df.empty:
+            st.warning("No valid eBay orders found in the file.")
+            return
+        cfg = {"rates": rates, "max_name": max_name, "lookup": lookup}
+        parcels, sub_rows, sub_marks, marks, lines_out = process(df, cols, cfg, overrides)
+        out_bytes = build_workbook(parcels, sub_rows, sub_marks, marks)
+        orders_df, lines_df = build_report(parcels, lines_out)
+    except Exception as e:  # noqa
+        st.error(f"Error processing orders: {e}")
+        raise
 
-    df_art_export = df_art_final.reindex(columns=ref_art_cols)
-    df_sub_export = df_sub_final.reindex(columns=ref_sub_cols)
+    n_chk = int((orders_df["Status"] == "CHECK").sum())
+    n_rev = int((orders_df["Status"] == "Review").sum())
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Parcels", len(orders_df))
+    c2.metric("Line items", len(lines_df))
+    c3.metric("🟥 Must fix", n_chk)
+    c4.metric("🟨 Review", n_rev)
 
-    with pd.ExcelWriter(output_buffer, engine="openpyxl") as writer:
-      df_art_export.to_excel(writer, sheet_name="ArticleDetails", index=False)
-      df_sub_export.to_excel(writer, sheet_name="SubPieces", index=False)
+    ts = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+    d1, d2 = st.columns(2)
+    d1.download_button("📥 Download India Post Excel", out_bytes, f"IndiaPost_BulkUpload_{ts}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
+    rep = io.BytesIO()
+    with pd.ExcelWriter(rep, engine="openpyxl") as w:
+        orders_df.drop(columns="_order_key").to_excel(w, sheet_name="Parcels", index=False)
+        lines_df.to_excel(w, sheet_name="Line items", index=False)
+        ot = overrides_template(lines_df)
+        if not ot.empty:
+            ot.to_excel(w, sheet_name="overrides_to_fill", index=False)
+    d2.download_button("📄 Download Review Report", rep.getvalue(), f"Review_{ts}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-      try:
-        for sheet in ["PickupAddress", "Information"]:
-          if sheet in wb_tpl.sheetnames:
-            df_extra = pd.read_excel(tpl_path, sheet_name=sheet)
-            df_extra.to_excel(writer, sheet_name=sheet, index=False)
-      except:
-        pass
+    t1, t2, t3 = st.tabs(["⚠️ Needs attention", "All parcels", "Line items (what each parcel contains)"])
+    show = orders_df.drop(columns="_order_key")
+    with t1:
+        att = show[show["Status"] != "OK"].copy()
+        att = att.iloc[att["Status"].map({"CHECK": 0, "Review": 1}).argsort(kind="stable")]
+        if att.empty:
+            st.success("Nothing needs attention 🎉")
+        else:
+            st.dataframe(att[["Serial", "Order", "Status", "Ship-To name", "Address 1", "City", "Postcode",
+                              "Address source", "Notes"]], use_container_width=True, hide_index=True)
+    with t2:
+        st.dataframe(show.drop(columns=["Notes"]), use_container_width=True, hide_index=True)
+    with t3:
+        st.dataframe(lines_df, use_container_width=True, hide_index=True)
+        if (lines_df["Source"] != "Your tuned rule").any():
+            st.caption("Rows with Source = Estimated/UNKNOWN: fix them once in the report's 'overrides_to_fill' sheet, "
+                       "save as overrides.xlsx next to app.py, and they will be correct from then on.")
 
-    # Apply Pink Highlighting to PHYSICAL WEIGHT & Yellow Highlighting to Fallback RECEIVER STATE
-    wb_out = openpyxl.load_workbook(output_buffer)
-    ws_out_art = wb_out["ArticleDetails"]
-    pink_fill = PatternFill(
-        start_color="FFB6C1", end_color="FFB6C1", fill_type="solid"
-    )
-    yellow_fill = PatternFill(
-        start_color="FFFF00", end_color="FFFF00", fill_type="solid"
-    )
 
-    header_cols = {
-        ws_out_art.cell(1, c).value: c
-        for c in range(1, ws_out_art.max_column + 1)
-    }
-    sno_col = header_cols.get("SERIAL NUMBER", 1)
-    wt_col = header_cols.get("PHYSICAL WEIGHT", 7)
-    state_col = header_cols.get("RECEIVER STATE", 31)
-
-    for r in range(2, ws_out_art.max_row + 1):
-      s_val = ws_out_art.cell(r, sno_col).value
-      # Multi-packs -> Pink
-      if s_val in highlight_articles:
-        ws_out_art.cell(r, wt_col).fill = pink_fill
-      # Blank State auto-filled with City -> Yellow
-      if s_val in yellow_state_articles:
-        ws_out_art.cell(r, state_col).fill = yellow_fill
-
-    final_buffer = io.BytesIO()
-    wb_out.save(final_buffer)
-
-    st.subheader("📋 Output Verification")
-    c1, c2 = st.columns(2)
-    with c1:
-      st.metric("Total Parcels (Articles)", len(df_art_export))
-      st.caption("Multi-packs: Pink | Fallback States: Yellow")
-      st.dataframe(
-          df_art_export[[
-              "SERIAL NUMBER",
-              "RECEIVER NAME",
-              "DESTINATION COUNTRY NAME",
-              "DESTINATION COUNTRY CODE",
-              "RECEIVER CITY",
-              "RECEIVER STATE",
-              "PHYSICAL WEIGHT",
-              "DECLARED VALUE",
-          ]]
-      )
-    with c2:
-      st.metric("Total SubPieces", len(df_sub_export))
-      st.dataframe(
-          df_sub_export[[
-              "SERIAL NUMBER REF ",
-              "HS DESCRIPTION",
-              "SP COUNT",
-              "SP INV CURRENCY CODE",
-              "SP INV EXCHANGE RATE",
-              "SP INV VALUE TOTAL",
-          ]]
-      )
-
-    export_date = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-    st.download_button(
-        label="📥 Download India Post Excel File",
-        data=final_buffer.getvalue(),
-        file_name=f"IndiaPost_BulkUpload_{export_date}.xlsx",
-        mime=(
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        ),
-    )
-
-  except Exception as e:
-    st.error(f"Error processing orders: {str(e)}")
+if __name__ == "__main__":
+    main()
