@@ -15,6 +15,7 @@ Changes vs v1
 """
 import io
 import json
+import math
 import os
 import re
 import urllib.request
@@ -878,13 +879,116 @@ def show_legend():
         st.markdown(rows, unsafe_allow_html=True)
 
 
+# ======================================================================
+# 10. eBay price calculator (same results as the reference calculator)
+# ======================================================================
+CALC_MARKETS = {
+    "UK": dict(cur="GBP", sym="£", s0=236.0, ds=29.5, rate=115.0),
+    "USA": dict(cur="USD", sym="$", s0=472.0, ds=41.3, rate=85.0),
+    "Australia": dict(cur="AUD", sym="A$", s0=466.1, ds=53.1, rate=60.0),
+    "Canada": dict(cur="CAD", sym="C$", s0=401.2, ds=47.2, rate=59.0),
+}
+
+
+def round_half_up(x, nd=2):
+    f = 10 ** nd
+    return math.floor(x * f + 0.5 + 1e-7) / f
+
+
+def calc_shipping(weight_g, m):
+    """Weight is rounded UP to the next 50 g slab; cost = first slab + step per extra slab (INR, GST incl.)."""
+    if weight_g <= 0:
+        return 0.0, 0
+    n = math.ceil(weight_g / 50)
+    return round_half_up(m["s0"] + m["ds"] * (n - 1)), n * 50
+
+
+def calc_price99(price):
+    """Next price ending in .99 that is above the 2-decimal price (11.81 -> 11.99, 11.99 -> 12.99)."""
+    if price <= 0:
+        return 0.0
+    p = math.floor(price) + 0.99
+    if p <= price + 1e-9:
+        p += 1
+    return round_half_up(p)
+
+
+def calc_listing_price(cost, profit, weight_g, fee_pct, rate, m, ship_override=None):
+    ship, slab = calc_shipping(weight_g, m)
+    if ship_override:
+        ship = ship_override
+    base = cost + profit + ship
+    price = round_half_up(base / (1 - fee_pct / 100) / rate)
+    final = calc_price99(price)
+    sale_inr = final * rate
+    fee_inr = sale_inr * fee_pct / 100
+    return dict(ship=ship, slab=slab, base=base, price=price, final=final, sale_inr=sale_inr,
+                fee_inr=fee_inr, real_profit=sale_inr - fee_inr - cost - ship)
+
+
+def price_calculator():
+    st.subheader("💰 eBay Price Calculator")
+    st.caption("Item cost + profit + shipping + eBay fee → listing price ending in .99. "
+               "Shipping uses the ITPS rate table (GST included), same as the reference calculator.")
+    mp = st.selectbox("Marketplace", list(CALC_MARKETS), key="calc_mp")
+    m = CALC_MARKETS[mp]
+    left, right = st.columns([1, 1], gap="large")
+    with left:
+        a, b = st.columns(2)
+        cost = a.number_input("Item cost (INR)", min_value=0.0, value=450.0, step=10.0, key="calc_cost")
+        profit = b.number_input("Desired profit (INR)", min_value=0.0, value=300.0, step=10.0, key="calc_profit")
+        c, d = st.columns(2)
+        weight = c.number_input("Shipping weight (grams)", min_value=0, value=250, step=50, key="calc_wt")
+        fee = d.number_input("eBay fee (%)", min_value=0.0, max_value=99.0, value=15.0, step=0.5,
+                             key=f"calc_fee_{mp}", help="Placeholder 15%. Set your real fee.")
+        rate = st.number_input(f"Exchange rate (INR per {m['cur']})", min_value=0.01, value=m["rate"], step=1.0,
+                               key=f"calc_rate_{mp}")
+        ship_ov = st.number_input("Shipping override in INR (0 = use rate table)", min_value=0.0, value=0.0,
+                                  step=10.0, key="calc_ship_ov")
+    r = calc_listing_price(cost, profit, weight, fee, rate, m, ship_ov or None)
+    with right:
+        st.markdown("**Final listing price (.99)**")
+        st.markdown(f"<div style='font-size:2.6rem;font-weight:700;color:#2b3ea0'>{m['sym']}{r['final']:,.2f} "
+                    f"<span style='font-size:1rem;color:#888'>{m['cur']}</span></div>", unsafe_allow_html=True)
+        rows = [
+            ("Item cost", f"₹{cost:,.2f}"),
+            (f"Shipping ({mp}" + (", override)" if ship_ov else f", up to {r['slab']} g)"), f"₹{r['ship']:,.2f}"),
+            ("Desired profit", f"₹{profit:,.2f}"),
+            ("Base cost (cost + profit + shipping)", f"₹{r['base']:,.2f}"),
+            ("Price before .99 rounding", f"{m['sym']}{r['price']:,.2f}"),
+            ("Sale value at final price", f"₹{r['sale_inr']:,.0f}"),
+            (f"eBay fee ({fee:g}%)", f"- ₹{r['fee_inr']:,.0f}"),
+            ("Profit at final price", f"₹{r['real_profit']:,.0f}"),
+        ]
+        st.table(pd.DataFrame(rows, columns=["", "INR / price"]).set_index(""))
+        if r["real_profit"] >= profit - 0.5:
+            st.success("Meets your profit target")
+        else:
+            st.warning("Below your profit target")
+        st.caption("Assumes free shipping to the buyer, so shipping and the eBay fee come out of the listing price.")
+    with st.expander("Shipping rates reference (INR, ITPS, GST included)"):
+        wts = list(range(50, 5001, 50))
+        tbl = pd.DataFrame({"Weight (g)": wts, **{
+            name: [int(round_half_up(CALC_MARKETS[name]["s0"] + CALC_MARKETS[name]["ds"] * (w // 50 - 1), 0))
+                   for w in wts] for name in ["USA", "UK", "Canada", "Australia"]}})
+        st.dataframe(tbl, hide_index=True, use_container_width=True, height=380)
+
+
 def main():
-    st.set_page_config(page_title="India Post Label Generator - Sharmex Global", page_icon="📦", layout="wide")
+    st.set_page_config(page_title="Sharmex Global Tools", page_icon="📦", layout="wide")
+    tab_labels, tab_calc = st.tabs(["📦 India Post Label Generator", "💰 eBay Price Calculator"])
+    with tab_labels:
+        label_generator()
+    with tab_calc:
+        price_calculator()
+
+
+def label_generator():
     st.title("📦 India Post Bulk Label Generator")
     st.caption("Ship-To address always used · Multi-buy aware (reads Variation details) · Readable item names")
 
     with st.sidebar:
-        st.header("Settings")
+        st.header("Label generator settings")
         rates = {
             "GBP": st.number_input("GBP → INR", value=DEFAULT_RATES["GBP"], step=1.0),
             "USD": st.number_input("USD → INR", value=DEFAULT_RATES["USD"], step=1.0),
