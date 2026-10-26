@@ -13,11 +13,13 @@ Changes vs v1
   * Writes into your template.xlsx (keeps its formatting and the Information sheet) and gives
     a separate Review Report so the upload file stays clean.
 """
+import base64
 import io
 import json
 import math
 import os
 import re
+import urllib.error
 import urllib.request
 
 import openpyxl
@@ -27,6 +29,8 @@ from openpyxl.styles import PatternFill
 
 TEMPLATE_PATH = "template.xlsx"
 OVERRIDES_PATH = "overrides.xlsx"  # optional, lives next to app.py
+HISTORY_PATH = "order_history.csv"  # learned weights/prices, lives next to app.py
+ESTIMATED_SOURCES = ("Estimated (category)", "UNKNOWN item")
 
 SENDER = {
     "SENDER NAME": "NEELA SHARMA",
@@ -591,7 +595,7 @@ def load_overrides(file_or_path):
     return out
 
 
-def resolve_item(title, variation, item_id, cfg, overrides):
+def resolve_item(title, variation, item_id, cfg, overrides, learned=None):
     is_bv = bool(re.search(r"bella ?vita", clean_str(title), re.I))
     v = variation_pack(variation)
     if v:
@@ -617,11 +621,116 @@ def resolve_item(title, variation, item_id, cfg, overrides):
         val = ov["val"] * scale if ov["val"] else val
         name = ov["name"] or name
         source = "Override file"
+    elif learned:
+        L = learned["exact"].get((item_id, pack))
+        P = learned["per_pack"].get(item_id)
+        if L:
+            hs, wt, val, name = L["hs"] or hs, L["wt"], L["val"], L["name"] or name
+            source = "Learned (history)"
+        elif P:
+            hs, wt, val = P["hs"] or hs, P["wt"] * pack, P["val"] * pack
+            source = "Learned (history, per-pack)"
     return {
         "name": name, "hs": hs, "wt": int(round(wt)), "val": int(round(val)),
         "pack": pack, "pack_src": pack_src, "source": source,
-        "estimated": source in ("Estimated (category)", "UNKNOWN item"),
+        "estimated": source in ESTIMATED_SOURCES,
     }
+
+
+# ======================================================================
+# 6b. HSTUS code (US orders) and learned history
+# ======================================================================
+def hstus_code(hs, dest_code):
+    """US orders only: HSN/HS code + '00' (8 digits -> 10 digits)."""
+    if dest_code != "US":
+        return ""
+    d = re.sub(r"\D", "", clean_str(hs))
+    if not d:
+        return ""
+    return d[:10] if len(d) >= 10 else d + "00"
+
+
+HISTORY_COLS = ["saved_at", "order", "destination", "item_id", "pack", "qty", "title", "name", "hs", "hstus",
+                "unit_wt", "unit_inr", "line_wt", "line_inr", "sold_unit", "currency", "fob_total", "source",
+                "confirmed"]
+
+
+def load_history(src):
+    try:
+        df = pd.read_csv(src, dtype=str).fillna("")
+    except Exception:
+        return pd.DataFrame(columns=HISTORY_COLS)
+    for c in HISTORY_COLS:
+        if c not in df.columns:
+            df[c] = ""
+    return df[HISTORY_COLS]
+
+
+def merge_history(old, new):
+    both = pd.concat([old, new], ignore_index=True)
+    return both.drop_duplicates(["order", "item_id", "pack"], keep="last").reset_index(drop=True)
+
+
+def learn_from_history(hist):
+    """Only rows you confirmed/edited are trusted. Exact (item, pack) match first; otherwise per-pack rate x pack."""
+    exact, per_pack = {}, {}
+    if hist is None or hist.empty:
+        return {"exact": exact, "per_pack": per_pack}
+    h = hist[hist["confirmed"].astype(str).str.lower() == "true"].sort_values("saved_at", kind="stable")
+    for _, r in h.iterrows():
+        try:
+            pack = max(1, int(float(r["pack"] or 1)))
+            wt, val = float(r["unit_wt"]), float(r["unit_inr"])
+        except ValueError:
+            continue
+        if wt <= 0:
+            continue
+        exact[(r["item_id"], pack)] = {"name": r["name"], "hs": r["hs"], "wt": wt, "val": val}
+        per_pack[r["item_id"]] = {"hs": r["hs"], "wt": wt / pack, "val": val / pack}
+    return {"exact": exact, "per_pack": per_pack}
+
+
+def history_from_lines(lines_df):
+    if lines_df is None or lines_df.empty:
+        return pd.DataFrame(columns=HISTORY_COLS)
+    now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    return pd.DataFrame({
+        "saved_at": now, "order": lines_df["Order"], "destination": lines_df["Destination"],
+        "item_id": lines_df["Item number"], "pack": lines_df["Pack"], "qty": lines_df["Qty"],
+        "title": lines_df["eBay title"], "name": lines_df["India Post name"], "hs": lines_df["HS"],
+        "hstus": lines_df["HSTUS"], "unit_wt": lines_df["Unit wt (g)"], "unit_inr": lines_df["Unit INR"],
+        "line_wt": lines_df["Line wt (g)"], "line_inr": lines_df["Line INR"], "sold_unit": lines_df["Sold unit"],
+        "currency": lines_df["Currency"], "fob_total": lines_df["FOB total"], "source": lines_df["Source"],
+        "confirmed": lines_df["Confirmed"].astype(bool).astype(str),
+    }).astype(str)[HISTORY_COLS]
+
+
+def github_enabled():
+    try:
+        return bool(st.secrets.get("GITHUB_TOKEN")) and bool(st.secrets.get("GITHUB_REPO"))
+    except Exception:
+        return False
+
+
+def github_push(path, data, message):
+    """Optional: commit a file to your repo (needs GITHUB_TOKEN + GITHUB_REPO in Streamlit secrets)."""
+    tok, repo = st.secrets["GITHUB_TOKEN"], st.secrets["GITHUB_REPO"]
+    branch = st.secrets.get("GITHUB_BRANCH", "main")
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    hdr = {"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json", "User-Agent": "label-tool"}
+    sha = None
+    try:
+        with urllib.request.urlopen(urllib.request.Request(f"{url}?ref={branch}", headers=hdr), timeout=15) as r:
+            sha = json.loads(r.read().decode())["sha"]
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+    body = {"message": message, "content": base64.b64encode(data).decode(), "branch": branch}
+    if sha:
+        body["sha"] = sha
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=hdr, method="PUT")
+    with urllib.request.urlopen(req, timeout=20):
+        pass
 
 
 # ======================================================================
@@ -638,7 +747,7 @@ def currency_from_symbol(s, fallback):
     return fallback
 
 
-def process(df, cols, cfg, overrides):
+def process(df, cols, cfg, overrides, learned=None):
     today = pd.Timestamp.now().strftime("%Y-%m-%d")
     col = lambda n: cols.get(norm(n))
     c_item, c_title, c_qty = col("Item number"), col("Item title"), col("Quantity")
@@ -724,7 +833,7 @@ def process(df, cols, cfg, overrides):
             except ValueError:
                 qty = 1
             variation = clean_str(row[c_var]) if c_var else ""
-            it = resolve_item(title, variation, item_id, cfg, overrides)
+            it = resolve_item(title, variation, item_id, cfg, overrides, learned)
             cur = currency_from_symbol(row[c_sold] if c_sold else "", cur_default)
             rate_cur = cur
             rate = cfg["rates"].get(cur, DEFAULT_RATES.get(cur, 100.0))
@@ -747,6 +856,7 @@ def process(df, cols, cfg, overrides):
                 "SP ASBL INR VAL": tot_val, "SP TAX INVOICE NO": order_id, "SP TAX INVOICE DATE": today,
                 "SP INV VALUE PU": it["val"], "SP INV VALUE TOTAL": tot_val,
                 "ecommerce_url": "Ebay.com", "ecommerce_sku": item_id,
+                "HSTUS CODE": hstus_code(it["hs"], code),
             })
             if it["estimated"]:
                 sub_marks.append((len(sub_rows) - 1, ORANGE))
@@ -755,6 +865,8 @@ def process(df, cols, cfg, overrides):
                 "Variation": variation, "Qty": qty, "Pack": it["pack"], "Pack from": it["pack_src"],
                 "India Post name": it["name"], "HS": it["hs"], "Unit wt (g)": it["wt"], "Line wt (g)": tot_wt,
                 "Line INR": tot_val, "Source": it["source"],
+                "Unit INR": it["val"], "Destination": code, "HSTUS": hstus_code(it["hs"], code),
+                "Sold unit": unit_fob, "Currency": cur, "FOB total": round(unit_fob * qty, 2),
             })
             if it["source"] == "UNKNOWN item":
                 flags.append(("warn", f"Item {item_id}: product type not recognised - check HS/weight"))
@@ -774,7 +886,7 @@ def process(df, cols, cfg, overrides):
         parcels.append({
             "SERIAL NUMBER": serial, "DESTINATION COUNTRY NAME": cname, "DESTINATION COUNTRY CODE": code,
             "MAIL NATURE TYPE": 11, "MAIL TRANSPORT TYPE": "AMS", "PHYSICAL WEIGHT": parcel_wt,
-            "DECLARED VALUE": parcel_val, "NON DELIVERY INSTRUCTIONS": "P",
+            "DECLARED VALUE": parcel_val, "NON DELIVERY INSTRUCTIONS": "P", "INCOTERMS": "DDP",
             **SENDER,
             "RECEIVER NAME": addr["name"], "RECEIVER ADD LINE 1": addr["add1"],
             "RECEIVER ADD LINE 2": addr["add2"], "RECEIVER CITY": addr["city"], "RECEIVER STATE": state,
@@ -796,29 +908,92 @@ def process(df, cols, cfg, overrides):
 # ======================================================================
 # 8. Excel output
 # ======================================================================
+# columns India Post's newer templates may call slightly differently
+ALIAS_KEYS = {"incoterm": "INCOTERMS", "hstus": "HSTUS CODE"}
+REQUIRED_COLS = {"ArticleDetails": ["INCOTERMS"], "SubPieces": ["HSTUS CODE"]}
+
+
 def build_workbook(parcels, sub_rows, sub_marks, marks):
+    """Returns (xlsx bytes, [columns that were missing in template.xlsx and were added at the end])."""
     wb = openpyxl.load_workbook(TEMPLATE_PATH)
+    added = []
     for name, rows in (("ArticleDetails", parcels), ("SubPieces", sub_rows)):
         ws = wb[name]
-        header = {str(c.value): c.column for c in ws[1] if c.value}
+        header = {norm(c.value): c.column for c in ws[1] if c.value}
+        for extra in REQUIRED_COLS[name]:
+            n = norm(extra)
+            have = n in header or any(ALIAS_KEYS.get(h) == extra for h in header)
+            if not have:
+                last = max(header.values())
+                cell = ws.cell(1, last + 1, extra)
+                prev = ws.cell(1, last)
+                cell._style = prev._style
+                header[n] = last + 1
+                added.append(f"{name}: {extra}")
         if ws.max_row > 1:
             ws.delete_rows(2, ws.max_row)
         for r_i, row in enumerate(rows, start=2):
-            for h, ci in header.items():
-                v = row.get(h, None)
+            rowmap = {norm(k): k for k in row}
+            for hn, ci in header.items():
+                key = rowmap.get(hn) or (ALIAS_KEYS.get(hn) if ALIAS_KEYS.get(hn) in row else None)
+                v = row.get(key) if key else None
                 if v == "":
                     v = None
                 ws.cell(r_i, ci, v)
         if name == "ArticleDetails":
             for (serial, colname), fill in marks.items():
-                if colname in header:
-                    ws.cell(serial + 1, header[colname]).fill = fill
+                if norm(colname) in header:
+                    ws.cell(serial + 1, header[norm(colname)]).fill = fill
         else:
             for idx, fill in sub_marks:
-                ws.cell(idx + 2, header["HS DESCRIPTION"]).fill = fill
+                ws.cell(idx + 2, header[norm("HS DESCRIPTION")]).fill = fill
     buf = io.BytesIO()
     wb.save(buf)
-    return buf.getvalue()
+    return buf.getvalue(), added
+
+
+def apply_edits(parcels, sub_rows, lines_df, edited):
+    """Apply your edits (name, HS, unit weight, unit INR) to the SubPieces + parcel totals.
+    Returns (parcels, sub_rows, sub_marks, final_lines)."""
+    new_rows = [dict(r) for r in sub_rows]
+    final = lines_df.copy()
+    final["Confirmed"] = False
+    sub_marks = []
+    for i in range(len(new_rows)):
+        o, e = lines_df.iloc[i], edited.iloc[i]
+        try:
+            wt, val = float(e["Unit wt (g)"]), float(e["Unit INR"])
+        except (TypeError, ValueError):
+            wt, val = float(o["Unit wt (g)"]), float(o["Unit INR"])
+        hs, name = clean_str(e["HS"]), clean_str(e["India Post name"])
+        changed = (abs(wt - float(o["Unit wt (g)"])) > 1e-9 or abs(val - float(o["Unit INR"])) > 1e-9
+                   or hs != clean_str(o["HS"]) or name != clean_str(o["India Post name"]))
+        conf = bool(e["Confirmed"]) or changed
+        r = new_rows[i]
+        qty = r["SP COUNT"]
+        tw, tv = int(round(wt * qty)), int(round(val * qty))
+        r.update({"HS CODE": hs, "CTH CODE": hs, "HS DESCRIPTION": name, "SP WEIGHT TOTAL": tw, "SP NET WEIGHT": tw,
+                  "SP ASBL INR VAL": tv, "SP INV VALUE PU": int(round(val)), "SP INV VALUE TOTAL": tv,
+                  "HSTUS CODE": hstus_code(hs, o["Destination"])})
+        if o["Source"] in ESTIMATED_SOURCES and not conf:
+            sub_marks.append((i, ORANGE))
+        final.iloc[i, final.columns.get_loc("India Post name")] = name
+        for col, v in (("HS", hs), ("Unit wt (g)", int(round(wt))), ("Unit INR", int(round(val))),
+                       ("Line wt (g)", tw), ("Line INR", tv), ("HSTUS", hstus_code(hs, o["Destination"]))):
+            final.iloc[i, final.columns.get_loc(col)] = v
+        final.iloc[i, final.columns.get_loc("Confirmed")] = conf or str(o["Source"]).startswith(("Learned", "Override"))
+    wt_by, val_by = {}, {}
+    for r in new_rows:
+        k = r["SERIAL NUMBER REF "]
+        wt_by[k] = wt_by.get(k, 0) + r["SP WEIGHT TOTAL"]
+        val_by[k] = val_by.get(k, 0) + r["SP ASBL INR VAL"]
+    new_parcels = []
+    for p in parcels:
+        p2 = dict(p)
+        p2["PHYSICAL WEIGHT"] = wt_by.get(p["SERIAL NUMBER"], p["PHYSICAL WEIGHT"])
+        p2["DECLARED VALUE"] = val_by.get(p["SERIAL NUMBER"], p["DECLARED VALUE"])
+        new_parcels.append(p2)
+    return new_parcels, new_rows, sub_marks, final
 
 
 def build_report(parcels, lines_out):
@@ -1000,6 +1175,8 @@ def label_generator():
                              help="Uses postcodes.io (UK) / zippopotam.us (US). Filled cells are sky blue - verify them.")
         ov_file = st.file_uploader("overrides.xlsx (optional)", type=["xlsx"],
                                    help="Your permanent corrections: item_id, pack, name, hs_code, weight_g, value_inr")
+        hist_file = st.file_uploader("order_history.csv (optional)", type=["csv"],
+                                     help="History saved from earlier runs. Confirmed weights/prices are re-used automatically.")
 
     show_legend()
 
@@ -1015,18 +1192,50 @@ def label_generator():
     elif os.path.exists(OVERRIDES_PATH):
         overrides = load_overrides(OVERRIDES_PATH)
 
+    hist = load_history(HISTORY_PATH) if os.path.exists(HISTORY_PATH) else load_history(None)
+    if hist_file is not None:
+        hist = merge_history(hist, load_history(hist_file))
+    learned = learn_from_history(hist)
+
     try:
         df, cols = read_orders_csv(up.getvalue())
         if df.empty:
             st.warning("No valid eBay orders found in the file.")
             return
         cfg = {"rates": rates, "max_name": max_name, "lookup": lookup}
-        parcels, sub_rows, sub_marks, marks, lines_out = process(df, cols, cfg, overrides)
-        out_bytes = build_workbook(parcels, sub_rows, sub_marks, marks)
-        orders_df, lines_df = build_report(parcels, lines_out)
+        parcels0, sub_rows0, sub_marks0, marks, lines_out = process(df, cols, cfg, overrides, learned)
+        _, lines0 = build_report(parcels0, lines_out)
     except Exception as e:  # noqa
         st.error(f"Error processing orders: {e}")
         raise
+
+    # ---- review & adjust items (edits are applied to the Excel and can be saved as history)
+    n_est = int(lines0["Source"].isin(ESTIMATED_SOURCES).sum())
+    n_learned = int(lines0["Source"].astype(str).str.startswith("Learned").sum())
+    with st.expander(f"✏️ Review & adjust item weights / HS / prices  ·  {n_est} estimated, {n_learned} learned from history",
+                     expanded=n_est > 0):
+        st.caption("Edit the white columns if a weight, HS code, value or name is wrong, or tick Confirmed if it is "
+                   "right. Edited/confirmed items are saved to history and used automatically next time.")
+        ed = lines0[["Serial", "Order", "Item number", "eBay title", "Qty", "Pack", "Source", "India Post name", "HS",
+                     "Unit wt (g)", "Unit INR"]].copy()
+        ed["Confirmed"] = lines0["Source"].astype(str).str.startswith(("Learned", "Override"))
+        key = f"lines_editor_{getattr(up, 'name', '')}_{getattr(up, 'size', len(lines0))}_{len(lines0)}"
+        edited = st.data_editor(
+            ed, key=key, hide_index=True, use_container_width=True,
+            disabled=["Serial", "Order", "Item number", "eBay title", "Qty", "Pack", "Source"],
+            column_config={
+                "Unit wt (g)": st.column_config.NumberColumn(min_value=0, step=1, help="Weight of ONE line unit incl. pack"),
+                "Unit INR": st.column_config.NumberColumn(min_value=0, step=1, help="Declared INR value of one line unit"),
+                "Confirmed": st.column_config.CheckboxColumn(help="Tick = these values are correct, learn them"),
+            })
+    parcels, sub_rows, sub_marks, final_lines = apply_edits(parcels0, sub_rows0, lines0, edited)
+    out_bytes, added_cols = build_workbook(parcels, sub_rows, sub_marks, marks)
+    orders_df, _ = build_report(parcels, lines_out)
+    lines_df = final_lines
+    if added_cols:
+        st.warning("Your template.xlsx has no column for: " + ", ".join(added_cols) +
+                   ". They were added at the end. If India Post rejects the file, add these headers to template.xlsx "
+                   "in the right place.")
 
     n_chk = int((orders_df["Status"] == "CHECK").sum())
     n_rev = int((orders_df["Status"] == "Review").sum())
@@ -1050,6 +1259,26 @@ def label_generator():
     d2.download_button("📄 Download Review Report", rep.getvalue(), f"Review_{ts}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+    # ---- history
+    merged = merge_history(hist, history_from_lines(lines_df))
+    h1, h2 = st.columns(2)
+    if h1.button("💾 Save this run to history (so the tool learns)"):
+        try:
+            merged.to_csv(HISTORY_PATH, index=False)
+            msg = f"Saved {len(merged)} history rows to {HISTORY_PATH}."
+            if github_enabled():
+                github_push(HISTORY_PATH, merged.to_csv(index=False).encode(), f"Update order history {ts}")
+                msg += " Also committed to GitHub."
+            else:
+                msg += " (On Streamlit Cloud this file is lost when the app restarts. Download it below and upload it to "
+                msg += "GitHub, or set GITHUB_TOKEN/GITHUB_REPO in Streamlit secrets for automatic saving.)"
+            st.success(msg)
+        except Exception as e:  # noqa
+            st.error(f"Could not save history: {e}")
+    h2.download_button("⬇️ Download history file", merged.to_csv(index=False).encode(), "order_history.csv",
+                       mime="text/csv")
+    st.caption(f"History: {len(hist)} saved rows · {len(learned['exact'])} confirmed items learned")
+
     t1, t2, t3 = st.tabs(["⚠️ Needs attention", "All parcels", "Line items (what each parcel contains)"])
     show = orders_df.drop(columns="_order_key")
     with t1:
@@ -1064,10 +1293,6 @@ def label_generator():
         st.dataframe(show.drop(columns=["Notes"]), use_container_width=True, hide_index=True)
     with t3:
         st.dataframe(lines_df, use_container_width=True, hide_index=True)
-        if (lines_df["Source"] != "Your tuned rule").any():
-            st.caption("Rows with Source = Estimated/UNKNOWN: fix them once in the report's 'overrides_to_fill' sheet, "
-                       "save as overrides.xlsx next to app.py, and they will be correct from then on.")
-
 
 if __name__ == "__main__":
     main()
