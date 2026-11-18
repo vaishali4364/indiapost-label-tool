@@ -623,10 +623,15 @@ BV_DROP = {"luxury", "perfume", "perfumes", "eau", "de", "parfum", "edp", "unise
 
 
 def bv_name(title, variation, pack, size_txt, max_len):
-    """Short, clear Bellavita name, e.g. 'BV White Oud 100ml', 'BV CEO Man + White Oud 2x20ml (2-Pack)',
-    'BV Date Woman 100ml', 'BV Gift Set 4x20ml CEO Oud Klub GOAT'."""
+    """Short, clear Bellavita name, e.g. 'Bellavita White Oud Perfume', 'Bellavita CEO Man + White Oud Perfume 2x20ml (2-Pack)',
+    'Bellavita Gift Set 4x20ml CEO Oud Klub GOAT'. A plain 100ml size is left out."""
     t = clean_str(title)
     is_set = bool(re.search(r"gift\s*set|all\s*star|gourmet", t, re.I))
+    if is_set:   # gift sets: 'Bellavita Men Gift Set' (+ pack count)
+        who = ("Unisex" if re.search(r"(?i)unisex", t) else "Women" if re.search(r"(?i)\bwom[ae]n", t)
+               else "Men" if re.search(r"(?i)\bm[ae]n\b|men's|\bfor him\b", t) else "")
+        out = f"Bellavita {who + ' ' if who else ''}Gift Set" + (f" ({pack}-Pack)" if pack > 1 else "")
+        return out[:max_len]
     t = re.sub(r"(?i)\b(?:set|pack)\s+of\s+\d+\s*(?:x\s*\d+\s*ml)?\s*(?:each)?\s*[-:]?", " ", t)
     t = re.sub(r"(?i)\b(?:bella\s*vita|bellavita)\b", " ", t)
     t = re.sub(r"\([^)]*\)", " ", t)
@@ -653,10 +658,13 @@ def bv_name(title, variation, pack, size_txt, max_len):
     # tidy '+' placement
     txt = re.sub(r"\s+", " ", " ".join(words)).strip(" +")
     txt = re.sub(r"(?:\+\s*)+$", "", txt).strip()
-    head = "BV " + (txt + " " if txt else "")
+    head = "Bellavita " + (txt + " " if txt else "")
     if is_set and "Set" not in txt:
         head += "Set "
-    out = head + (size_txt or "")
+    is_perfume = re.search(r"(?i)perfume|parfum|edp|cologne", clean_str(title) + " " + var)
+    if is_perfume and not re.search(r"(?i)perfume|shower|lotion|\bgel\b|wash", txt) and not is_set:
+        head += "Perfume "
+    out = head + ("" if re.fullmatch(r"(?i)100\s*ml", size_txt or "") else (size_txt or ""))
     if pack > 1:
         out += f" ({pack}-Pack)"
     return re.sub(r"\s+", " ", out).strip()[:max_len]
@@ -700,7 +708,7 @@ def resolve_item(title, variation, item_id, cfg, overrides, learned=None):
     if spec is None:
         spec = category_specs(clean_str(title).lower(), pack, size)
     if is_bv:
-        name = bv_name(title, variation, 1 if mset else pack, size_txt, cfg["max_name"])
+        name = bv_name(title, variation, pack if (pack_src == "variation" or not mset) else 1, size_txt, cfg["max_name"])
     else:
         name = friendly_name(title, spec["label"], 1 if mset else pack, size_txt, cfg["max_name"])
     source = {"rule": "Your tuned rule", "category": "Estimated (category)", "unknown": "UNKNOWN item"}[spec["conf"]]
