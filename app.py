@@ -385,9 +385,8 @@ def tuned_rules(t, pack):
         if any(k in t for k in ["combo", "2 pack", "2 x 100ml", "ceo + goat", "ceo and goat"]):
             return S("EDP Combo", "Bellavita CEO & GOAT 2Pk", hs, 848, 700)
         if any(k in t for k in ["gift set", "4 x 20ml", "4x20ml", "all star"]):
-            if bp == 2 or "pack of 2" in t or "2 bella vita" in t or "set 2" in t:
-                return S("Gift Set", "Bellavita Gift Set 4x20ml 2Pk", hs, 848, 700)
-            return S("Gift Set", "Bellavita Gift Set 4x20ml", hs, 398, 350)
+            gp = max(pack, bp, 2 if ("pack of 2" in t or "2 bella vita" in t or "set 2" in t) else 1)
+            return S("Gift Set", "Bellavita Gift Set 4x20ml", hs, 448 * gp, 350 * gp)
         if any(k in t for k in ["2 x 20ml", "2x20ml", "white and honey", "white oud & honey",
                                 "fresh + white", "date and senorita", "ceo + white", "date & glam"]):
             return S("Perfume Duo", "Bellavita Perfume Duo 2x20ml", hs, 198, 360)
