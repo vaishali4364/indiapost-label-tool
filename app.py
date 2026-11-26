@@ -946,7 +946,7 @@ def process(df, cols, cfg, overrides, learned=None):
             if qty > 1 or it["pack"] > 1:
                 multi = True
             sub_rows.append({
-                "SERIAL NUMBER REF ": serial, "HS CODE": it["hs"], "CTH CODE": hstus_code(it["hs"], code) or it["hs"],
+                "SERIAL NUMBER REF ": serial, "HS CODE": it["hs"], "CTH CODE": it["hs"], "SP SERIAL NUMBER": lsn,
                 "HS DESCRIPTION": it["name"], "SP UNIT CD": "PC", "SP COUNT": qty,
                 "SP WEIGHT TOTAL": tot_wt, "SP NET WEIGHT": tot_wt,
                 "SP ORIGIN COUNTRY CODE": "IN", "SP ORIGIN CURRENCY CODE": "INR",
@@ -956,7 +956,8 @@ def process(df, cols, cfg, overrides, learned=None):
                 "SP ASBL INR VAL": tot_val, "SP TAX INVOICE NO": order_id, "SP TAX INVOICE DATE": today,
                 "SP INV VALUE PU": it["val"], "SP INV VALUE TOTAL": tot_val,
                 "ecommerce_url": "Ebay.com", "ecommerce_sku": item_id,
-                "HSTUS CODE": hstus_code(it["hs"], code),
+                "HTSUS CODE": hstus_code(it["hs"], code),
+                "DETAILED DESCRIPTION OF GOODS": it["name"] if code == "US" else "",
             })
             if it["estimated"]:
                 sub_marks.append((len(sub_rows) - 1, ORANGE))
@@ -990,7 +991,7 @@ def process(df, cols, cfg, overrides, learned=None):
             **SENDER,
             "RECEIVER NAME": addr["name"], "RECEIVER EMAILID": RECEIVER_EMAIL, "RECEIVER ADD LINE 1": addr["add1"],
             "RECEIVER ADD LINE 2": addr["add2"], "RECEIVER CITY": addr["city"], "RECEIVER STATE": state,
-            "RECEIVER ZIPCODE": zipcode, "RECEIVER MOBILE NO": phone, "BULK REF": order_id,
+            "RECEIVER ZIPCODE": zipcode, "RECEIVER MOBILE NO": phone, "BULK REF": order_id, "POD FLAG": False, "PICKUP ADDRESS FLAG": False,
             "DROP OFF PINCODE": 136118, "PBE TYPE": "PBEIII", "PBE FILING": "SELF",
             "_flags": flags, "_ship_source": source, "_buyer": buyer, "_currency": rate_cur,
             "_multi": multi,
@@ -1009,7 +1010,9 @@ def process(df, cols, cfg, overrides, learned=None):
 # 8. Excel output
 # ======================================================================
 # columns India Post's newer templates may call slightly differently
-ALIAS_KEYS = {"incoterm": "INCOTERMS", "hstus": "HSTUS CODE"}
+# header (normalised) in the India Post template -> key used inside this app
+ALIAS_KEYS = {norm("ARTICLE SERIAL NUMBER"): "SERIAL NUMBER",
+              norm("ARTICLE SERIAL NUMBER REF"): "SERIAL NUMBER REF "}
 REQUIRED_COLS = {"ArticleDetails": ["INCOTERMS"], "SubPieces": []}
 
 
@@ -1030,8 +1033,16 @@ def build_workbook(parcels, sub_rows, sub_marks, marks):
                 cell._style = prev._style
                 header[n] = last + 1
                 added.append(f"{name}: {extra}")
-        if ws.max_row > 1:
-            ws.delete_rows(2, ws.max_row)
+        # clear the template's sample rows but keep cell styles, drop-downs and the country-code formulas
+        # (column DESTINATION COUNTRY CODE is a formula in the template; rows we use get the plain code)
+        for r_i in range(2, ws.max_row + 1):
+            for c_i in range(1, ws.max_column + 1):
+                cell = ws.cell(r_i, c_i)
+                if isinstance(cell.value, str) and cell.value.startswith("="):
+                    if r_i - 2 < len(rows):
+                        cell.value = None
+                else:
+                    cell.value = None
         for r_i, row in enumerate(rows, start=2):
             rowmap = {norm(k): k for k in row}
             for hn, ci in header.items():
@@ -1047,6 +1058,12 @@ def build_workbook(parcels, sub_rows, sub_marks, marks):
         else:
             for idx, fill in sub_marks:
                 ws.cell(idx + 2, header[norm("HS DESCRIPTION")]).fill = fill
+    for extra_sheet in ("DutyDrawback", "DutyDrawbackSupportingDocuments"):   # sample rows only; no drawback claimed
+        if extra_sheet in wb.sheetnames:
+            ws = wb[extra_sheet]
+            for r_i in range(2, ws.max_row + 1):
+                for c_i in range(1, ws.max_column + 1):
+                    ws.cell(r_i, c_i).value = None
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue(), added
@@ -1072,9 +1089,10 @@ def apply_edits(parcels, sub_rows, lines_df, edited):
         r = new_rows[i]
         qty = r["SP COUNT"]
         tw, tv = int(round(wt * qty)), int(round(val * qty))
-        r.update({"HS CODE": hs, "CTH CODE": hstus_code(hs, o["Destination"]) or hs, "HS DESCRIPTION": name, "SP WEIGHT TOTAL": tw, "SP NET WEIGHT": tw,
+        r.update({"HS CODE": hs, "CTH CODE": hs, "HS DESCRIPTION": name, "SP WEIGHT TOTAL": tw, "SP NET WEIGHT": tw,
                   "SP ASBL INR VAL": tv, "SP INV VALUE PU": int(round(val)), "SP INV VALUE TOTAL": tv,
-                  "HSTUS CODE": hstus_code(hs, o["Destination"])})
+                  "HTSUS CODE": hstus_code(hs, o["Destination"]),
+                  "DETAILED DESCRIPTION OF GOODS": name if o["Destination"] == "US" else ""})
         if o["Source"] in ESTIMATED_SOURCES and not conf:
             sub_marks.append((i, ORANGE))
         final.iloc[i, final.columns.get_loc("India Post name")] = name
